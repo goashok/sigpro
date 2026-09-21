@@ -2,6 +2,8 @@
 
 A browser-based prototype for credit analysts: connect evidence to a credit story, explore its impact, design a workflow, and track follow-up actions.
 
+This site was created with the `gpt-6-astra` model.
+
 ## Run
 
 Requires Node.js 18 or newer. No dependency installation is needed.
