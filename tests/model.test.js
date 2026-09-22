@@ -1,7 +1,100 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { configureSignalRoutes, enrichmentSelection, analysisContext, upstreamAnalysis, stepInsertionTargets, insertWorkflowStep, connectCanvasStep } from '../public/model.js';
 import { initialState, newStep, scenarioResult, validateWorkflow, createInboxRun, approveInboxRun, newSource, sourceErrors, sourceConfig, switchSourceType, workflowEdges, migrateWorkflow, receiveSignal, matchesPortfolio, defaultSummaryPrompt, publishingErrors, publishingRecipients, workflowBranches, enrichmentSnapshot, enrichmentErrors } from '../public/model.js';
 
+test('signal routes preserve existing settings and isolate enrichment, review and actions', () => {
+  const w = initialState().workflow;
+  w.steps.find(s => s.type === 'super').signalTypes = ['Refinancing pressure', 'Margin compression'];
+  w.steps.find(s => s.type === 'review').note = 'Preserve analyst guidance';
+  const router = configureSignalRoutes(w), branches = workflowBranches(w.steps);
+  assert.equal(router.routes.length, 2); assert.deepEqual(validateWorkflow(w.steps), []);
+  assert.equal(branches[0].steps.find(s => s.type === 'review').note, 'Preserve analyst guidance');
+  assert.deepEqual(branches[1].steps[0].enrichment.datasets, ['financials', 'models']);
+  assert.equal(branches[1].steps.at(-1).value, 'Margin stress');
+  const edges = workflowEdges(w.steps);
+  assert.equal(edges.filter(e => e.from === router.id).length, 2);
+  const before = structuredClone(w); configureSignalRoutes(w); assert.deepEqual(w, before);
+  w.steps = w.steps.filter(s => s.id !== branches[1].steps.find(s => s.type === 'review').id);
+  assert.ok(validateWorkflow(w.steps).some(e => e.includes('Margin compression: Extract inputs and review')));
+});
+test('multi-signal workflows require complete, unambiguous routes', () => {
+  const w = initialState().workflow;
+  w.steps.find(s => s.type === 'super').signalTypes = ['Refinancing pressure', 'Margin compression'];
+  assert.ok(validateWorkflow(w.steps).some(e => e.includes('Route by signal type')));
+  const router = configureSignalRoutes(w);
+  router.routes[1].signalType = 'Refinancing pressure';
+  assert.ok(validateWorkflow(w.steps).some(e => e.includes('exactly one route')));
+});
+test('route enrichment inherits shared selections without duplication or copying configuration', () => {
+  const w = initialState().workflow;
+  const shared = newStep('enrich'); shared.enrichment.datasets = ['ratings', 'financials'];
+  w.steps.splice(w.steps.findIndex(s => s.type === 'match') + 1, 0, shared);
+  configureSignalRoutes(w);
+  const route = workflowBranches(w.steps)[0].steps[0];
+  route.enrichment.datasets = ['ratings', 'debt'];
+  assert.deepEqual(enrichmentSelection(route, w.steps), {inherited:['ratings','financials'],additional:['debt'],effective:['ratings','financials','debt']});
+  const snapshot = enrichmentSnapshot(route, [], w.steps);
+  assert.equal(snapshot.datasets.length, 3); assert.equal(snapshot.datasets.filter(d => d.inherited).length, 2);
+  route.enrichment.datasets = []; assert.deepEqual(enrichmentErrors(route, w.steps), []);
+  shared.enrichment.datasets = ['ratings'];
+  assert.deepEqual(enrichmentSelection(route, w.steps).effective, ['ratings']);
+  w.steps = w.steps.filter(s => s !== shared);
+  assert.ok(enrichmentErrors(route, w.steps).length);
+});
+test('AI analysis receives only earlier context on its path and publication requires a valid output link', () => {
+  const w = initialState().workflow;
+  w.steps.find(s => s.type === 'super').signalTypes = ['Refinancing pressure', 'Margin compression'];
+  const router = configureSignalRoutes(w), [refinancing, margin] = router.routes;
+  w.steps = w.steps.filter(s => !['extract', 'review', 'scenario'].includes(s.type));
+  const ai = newStep('ai'); ai.branch = refinancing.id;
+  const publish = newStep('publish'); publish.branch = refinancing.id; publish.publishing.content = 'analysis'; publish.publishing.analysisStepId = ai.id;
+  const other = newStep('publish'); other.branch = margin.id;
+  w.steps.push(ai, publish, other);
+  assert.deepEqual(validateWorkflow(w.steps), []);
+  assert.deepEqual(analysisContext(w.steps, ai).map(d => d.id), ['ratings', 'debt', 'models']);
+  assert.deepEqual(upstreamAnalysis(w.steps, publish), [ai]);
+  assert.deepEqual(upstreamAnalysis(w.steps, other), []);
+  ai.prompt = ' '; assert.ok(validateWorkflow(w.steps).some(e => e.includes('analysis prompt'))); ai.prompt = 'Analyze credit risks.';
+  publish.publishing.prompt = ''; assert.deepEqual(validateWorkflow(w.steps), []);
+  w.steps = w.steps.filter(s => s !== ai);
+  assert.ok(validateWorkflow(w.steps).some(e => e.includes('earlier AI Analysis')));
+});
+test('anchored insertion preserves route order and sibling paths and links publication locally', () => {
+  const w = initialState().workflow;
+  w.steps.find(s => s.type === 'super').signalTypes = ['Refinancing pressure', 'Margin compression'];
+  const router = configureSignalRoutes(w), [first, second] = workflowBranches(w.steps);
+  const siblingBefore = structuredClone(second.steps);
+  const ai = insertWorkflowStep(w, first.steps[0].id, first.id, 'ai');
+  const publish = insertWorkflowStep(w, ai.id, first.id, 'publish');
+  assert.deepEqual(workflowBranches(w.steps)[0].steps.slice(0,4).map(s => s.type), ['enrich','ai','publish','extract']);
+  assert.equal(publish.publishing.analysisStepId, ai.id);
+  assert.deepEqual(workflowBranches(w.steps)[1].steps, siblingBefore);
+  assert.throws(() => insertWorkflowStep(w, ai.id, second.id, 'ai'));
+  assert.equal(stepInsertionTargets(w.steps, router.id).length, 2);
+  const head = insertWorkflowStep(w, router.id, second.id, 'ai');
+  assert.equal(workflowBranches(w.steps)[1].steps[0], head);
+  assert.deepEqual(validateWorkflow(w.steps), []);
+});
+test('new canvas cards stay detached until wired and draft chains attach to the chosen route', () => {
+  const w = initialState().workflow;
+  w.steps.find(s => s.type === 'super').signalTypes = ['Refinancing pressure','Margin compression'];
+  configureSignalRoutes(w);
+  const [first,second] = workflowBranches(w.steps), originalEdges = workflowEdges(w.steps);
+  const ai = {...newStep('ai'),detached:true,x:800,y:900}, publish = {...newStep('publish'),detached:true};
+  w.steps.push(ai,publish);
+  assert.deepEqual(workflowEdges(w.steps),originalEdges);
+  assert.ok(validateWorkflow(w.steps).some(e=>e.includes('unconnected')));
+  connectCanvasStep(w,ai.id,publish.id);
+  assert.ok(workflowEdges(w.steps).some(e=>e.from===ai.id&&e.to===publish.id));
+  assert.throws(()=>connectCanvasStep(w,publish.id,ai.id));
+  connectCanvasStep(w,second.steps[0].id,ai.id,second.id);
+  assert.equal(ai.detached,undefined);assert.equal(publish.detached,undefined);
+  assert.equal(ai.branch,second.id);assert.equal(publish.publishing.analysisStepId,ai.id);
+  assert.equal(ai.x,800);assert.equal(ai.y,900);
+  assert.deepEqual(workflowBranches(w.steps)[0].steps,first.steps);
+  assert.deepEqual(validateWorkflow(w.steps),[]);
+});
 test('default workflow is valid and requires review before a scenario', () => {
   const steps = initialState().workflow.steps;
   assert.deepEqual(validateWorkflow(steps), []);
@@ -194,7 +287,7 @@ test('review and extraction prerequisites must belong to the same path', () => {
   steps.splice(steps.indexOf(review), 0, publishing);
   const errors = validateWorkflow(steps);
   assert.ok(errors.some(e => e.includes('Scenario analysis: Extract inputs and review')));
-  assert.ok(errors.some(e => e.includes('Summary & publishing: Extract inputs before reviewing')));
+  assert.ok(errors.some(e => e.includes('Shared publishing: Extract inputs before reviewing')));
 });
 
 test('linear v3 draft migration preserves settings and splits publishing from analysis', () => {

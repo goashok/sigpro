@@ -1,4 +1,5 @@
-import { catalog, newStep, initialState, stories, validateWorkflow, scenarioResult, assumptionFields, createInboxRun, approveInboxRun, sourceTypes, newSource, sourceConfig, switchSourceType, sourceErrors, sourceSummary, workflowEdges, migrateWorkflow, receiveSignal, matchesPortfolio, sampleUser, defaultSummaryPrompt, publishingErrors, publishingRecipients, branchOf, workflowBranches, enrichmentDatasets, enrichmentErrors, enrichmentSnapshot, enrichmentSampleDate } from './model.js';
+import {createGraph,ancestors,connectGraph,connectionError,removeGraphStep,graphSelection,graphSnapshot,graphAnalysisContext,graphUpstreamAnalysis,validateGraph,simulationErrors,routeSignalTypes,setGraphSignalTypes} from './graph.js';
+import { catalog, newStep, initialState, stories, scenarioResult, assumptionFields, createInboxRun, approveInboxRun, sourceTypes, sourceConfig, switchSourceType, sourceErrors, sourceSummary, receiveSignal, sampleUser, defaultSummaryPrompt, publishingErrors, publishingRecipients, enrichmentDatasets, enrichmentSampleDate, selectedSignalTypes } from './model.js';
 
 const icons = {
   grid: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
@@ -35,22 +36,39 @@ try { state = JSON.parse(localStorage.getItem('sigpro-v1')); } catch {}
 if (!state || state.version !== 1) state = initialState();
 state.user ||= { ...sampleUser };
 function initializeWorkflows() {
-  if (!Array.isArray(state.workflows)) state.workflows = state.workflow ? [state.workflow] : [];
-  for (const workflow of state.workflows) { workflow.id ||= crypto.randomUUID(); migrateWorkflow(workflow); }
-  state.workflow = state.workflows.find(w => w.id === state.selectedWorkflowId) || state.workflows[0];
+  if (state.graphDesignerVersion !== 1) {
+    state.workflowResetBackup = state.workflows || (state.workflow ? [state.workflow] : []);
+    state.workflows = []; state.selectedWorkflowId = null; state.graphDesignerVersion = 1;
+  }
+  state.workflows ||= [];
+  state.workflow = state.workflows.find(w => w.id === state.selectedWorkflowId) || state.workflows[0] || null;
   state.selectedWorkflowId = state.workflow?.id || null;
 }
 initializeWorkflows();
 let workflowLibrary = true;
 if (!Array.isArray(state.runs)) state.runs = [createInboxRun()];
-let view = 'inbox', selected = 'aster', filter = 'All signals', query = '', selectedStep = state.workflow?.steps[0]?.id, zoom = 0.8, modal = null, addBranch = 'analysis';
+let view = 'inbox', selected = 'aster', filter = 'All signals', query = '', selectedStep = state.workflow?.steps[0]?.id, zoom = 0.8, modal = null;
 const app = document.querySelector('#app');
+const histories = new Map(), lastSaved = new Map(); let restoring = false, selectedEdge = null;
 const getStory = () => stories.find(s => s.id === selected) || stories[0];
 const priority = s => state.overrides[s.id]?.priority || s.priority;
 const latestRun = storyId => state.runs.find(run => run.storyId === storyId);
 const awaitingReview = storyId => latestRun(storyId)?.status === 'awaiting-review';
 const modalRun = () => state.runs.find(run => run.id === modal?.payload);
-function save() { try { localStorage.setItem('sigpro-v1', JSON.stringify(state)); } catch { toast('Browser storage is unavailable. Changes will last for this session.'); } }
+function save() {
+  if (state.workflow) {
+    const id=state.workflow.id, current=JSON.stringify(state.workflow), prior=lastSaved.get(id);
+    if (!restoring && prior && prior!==current) { const history=histories.get(id)||[]; history.push(prior); histories.set(id,history.slice(-40)); }
+    lastSaved.set(id,current);
+    const undo=document.querySelector('[data-action="undo-graph"]'); if(undo)undo.disabled=!(histories.get(id)?.length);
+  }
+  try { localStorage.setItem('sigpro-v1', JSON.stringify(state)); } catch { toast('Browser storage is unavailable. Changes last for this session.'); }
+}
+function undoGraph(){
+  const history=histories.get(state.workflow.id);if(!history?.length)return;
+  const restored=JSON.parse(history.pop());state.workflows[state.workflows.findIndex(w=>w.id===restored.id)]=restored;state.workflow=restored;
+  selectedStep=restored.steps.some(s=>s.id===selectedStep)?selectedStep:null;selectedEdge=null;restoring=true;save();restoring=false;renderView();
+}
 let toastTimer;
 function toast(message) { const el = document.querySelector('#toast'); el.textContent = message; el.classList.add('visible'); clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('visible'), 4000); }
 function badge(text, cls = '') { return `<span class="badge ${cls}">${esc(text)}</span>`; }
@@ -67,10 +85,13 @@ function shell() {
   renderView();
 }
 function renderView() {
+  const oldCanvas=document.querySelector('.canvas-scroll'),scroll=oldCanvas?{left:oldCanvas.scrollLeft,top:oldCanvas.scrollTop}:null;
   if (canvasSimulation.running) cancelSimulation('Simulation stopped because the view or workflow changed.');
   document.querySelector('#main').innerHTML = view === 'workflow' ? workflowLibrary ? workflowListView() : button('All workflows', 'workflow-list', 'secondary', 'arrow') + workflowView() : view === 'sources' ? sourcesView() : view === 'actions' ? actionsView() : inboxView();
   if (view === 'workflow' && !workflowLibrary) {
     markHumanInputSteps();
+    addConnectionControls();
+    if(scroll){const canvas=document.querySelector('.canvas-scroll');canvas.scrollLeft=scroll.left;canvas.scrollTop=scroll.top;}
     requestAnimationFrame(() => { drawConnections(); paintSimulation(); });
   }
 }
@@ -85,12 +106,12 @@ function markHumanInputSteps() {
     const marker = document.createElement('span');
     marker.className = 'human-input-marker';
     marker.innerHTML = `${icon('users')} ${required ? 'Human input required' : 'Human review if data issues'}`;
-    marker.title = required ? 'This path pauses until an analyst reviews assumptions in the Signal Inbox.' : 'Both paths pause for data review when enrichment finds stale or missing data.';
+    marker.title = required ? 'This path pauses until an analyst reviews assumptions in the Signal Inbox.' : 'Downstream steps pause for data review when this enrichment finds stale or missing data.';
     card.querySelector('.node-heading').after(marker);
   }
 }
 function selectWorkflowStep(id) {
-  selectedStep = id;
+  selectedStep = id; selectedEdge=null;
   // Keep the canvas mounted so selecting a step preserves its scroll and focus.
   const template = document.createElement('template');
   template.innerHTML = workflowView();
@@ -99,10 +120,88 @@ function selectWorkflowStep(id) {
     node.classList.toggle('selected', node.dataset.step === id);
   });
 }
+let wire = null;
+const signalColors = {
+  'Refinancing pressure': {line:'#3768c9', tint:'#edf3ff'},
+  'Margin compression': {line:'#8650b8', tint:'#f5effb'},
+  'Demand & revenue weakness': {line:'#b46c13', tint:'#fff5e7'},
+  'Governance risk': {line:'#b34c71', tint:'#fceff4'},
+  'Liquidity pressure': {line:'#218775', tint:'#eaf7f3'},
+};
+function signalColor(type) { return signalColors[type] || {line:'#7185a4',tint:'#f4f6f9'}; }
+function addConnectionControls() {
+  wire=null;
+  for(const card of document.querySelectorAll('.flow-node')){
+    const step=state.workflow.steps.find(s=>s.id===card.dataset.step),input=card.querySelector('.port-in'),output=card.querySelector('.port-out');
+    if(input){input.dataset.connectInput=step.id;input.tabIndex=0;input.setAttribute('role','button');input.setAttribute('aria-label','Input of '+catalog[step.type].label);}
+    if(step.type==='route'){
+      output.hidden=true;
+      const choices=document.createElement('div');choices.className='node-output-options';choices.dataset.outputFor=step.id;
+      choices.style.left=card.style.left;choices.style.top=(parseFloat(card.style.top)+card.offsetHeight+8)+'px';
+      const types=routeSignalTypes(state.workflow,step);
+      choices.innerHTML=types.map(type=>`<div class="signal-output-card" style="--signal-color:${signalColor(type).line};--signal-tint:${signalColor(type).tint}"><span>${esc(type)}</span><button class="signal-output-port" data-connect-output="${step.id}" data-connect-route="${esc(type)}" title="Connect ${esc(type)}" aria-label="Output for ${esc(type)}"></button></div>`).join('')||'<small>Select signals on the Super Signal card.</small>';
+      card.after(choices);
+    }else{output.dataset.connectOutput=step.id;output.tabIndex=0;output.setAttribute('role','button');output.setAttribute('aria-label','Output of '+catalog[step.type].label);}
+  }
+}
+function beginConnection(el) {
+  if (canvasSimulation.running) cancelSimulation();
+  wire = {from:el.dataset.connectOutput,route:el.dataset.connectRoute || undefined};
+  document.querySelector('.canvas-inner')?.classList.add('connecting');
+  toast('Choose an input dot. Escape cancels.');
+  document.querySelectorAll('[data-connect-input]').forEach(el=>el.classList.toggle('valid-target',!connectionError(state.workflow,wire.from,el.dataset.connectInput,wire.route)));
+}
+function finishConnection(toId) {
+  if(!wire)return;
+  try{
+    connectGraph(state.workflow,wire.from,toId,wire.route);
+    const step=state.workflow.steps.find(s=>s.id===toId);
+    if(step.type==='publish'&&!step.publishing.content){const ai=graphUpstreamAnalysis(state.workflow,step).at(-1);if(ai){step.publishing.content='analysis';step.publishing.analysisStepId=ai.id;}}
+    selectedStep=toId;selectedEdge=null;wire=null;save();renderView();toast('Connection added.');
+  }catch(error){toast(error.message);}
+}
+app.addEventListener('pointerdown', event => {
+  const port = event.target.closest('[data-connect-output], [data-connect-input]');
+  if (!port) return;
+  event.preventDefault(); event.stopImmediatePropagation();
+  if (port.dataset.connectOutput) beginConnection(port);
+  else if (wire) finishConnection(port.dataset.connectInput);
+}, true);
+app.addEventListener('click', event => {
+  const port = event.target.closest('[data-connect-output], [data-connect-input]');
+  if (!port) return;
+  event.preventDefault(); event.stopImmediatePropagation();
+  if (port.dataset.connectOutput) beginConnection(port);
+  else if (wire) finishConnection(port.dataset.connectInput);
+}, true);
+app.addEventListener('keydown', event => {
+  if (['Enter',' '].includes(event.key) && event.target.matches('[data-connect-output], [data-connect-input]')) { event.preventDefault(); event.target.click(); }
+});
+window.addEventListener('pointerup', event => {
+  const input = event.target.closest?.('[data-connect-input]');
+  if (wire && input) finishConnection(input.dataset.connectInput);
+});
+window.addEventListener('pointermove', event => {
+  if (!wire) return;
+  const canvas = document.querySelector('.canvas-inner'), svg = document.querySelector('#connections'); if (!canvas || !svg) return;
+  const output = [...canvas.querySelectorAll('[data-connect-output]')].find(el => el.dataset.connectOutput === wire.from && (el.dataset.connectRoute || undefined) === wire.route);
+  if (!output) return;
+  const origin = output.getBoundingClientRect(), bounds = canvas.getBoundingClientRect();
+  const x = (origin.x + origin.width / 2 - bounds.x) / zoom, y = (origin.y + origin.height / 2 - bounds.y) / zoom;
+  let line = svg.querySelector('.connection-preview');
+  if (!line) { line = document.createElementNS('http://www.w3.org/2000/svg','path'); line.setAttribute('class','connection-preview'); svg.append(line); }
+  line.style.stroke = signalColor(wire.route).line;
+  line.setAttribute('d', `M${x},${y} L${(event.clientX - bounds.x) / zoom},${(event.clientY - bounds.y) / zoom}`);
+});
+document.addEventListener('keydown', event => { if (event.key === 'Escape') { wire = null; document.querySelector('.connection-preview')?.remove(); document.querySelector('.connecting')?.classList.remove('connecting'); } });
+function openStepInsertion(afterId) {
+  openModal('add-step');
+}
 function workflowListView() {
-  return `${pageHead('WORKFLOW STUDIO', 'Your workflows', 'Create separate processes for the credits, sources, and actions you monitor.', button('Create workflow', 'create-workflow', 'primary', 'plus'))}<div class="workflow-library">${state.workflows.map(w => `<article class="workflow-library-card"><div>${badge(w.active ? 'Active · demo' : 'Draft', w.active ? 'support-badge' : 'neutral')}<h2>${esc(w.name)}</h2><p>${w.steps.filter(s => s.type === 'watch').length} sources · ${w.steps.length} steps · ${workflowBranches(w.steps).length} paths</p></div><div class="workflow-card-actions"><button class="btn secondary" data-open-workflow="${w.id}">Open workflow ${icon('arrow')}</button><button class="btn danger subtle" data-remove-workflow="${w.id}" aria-label="Remove ${esc(w.name)}">${icon('trash')} Remove</button></div></article>`).join('')}</div>${state.workflows.length ? '' : '<div class="empty-state large"><h2>No workflows yet</h2><p>Create a workflow to start monitoring signals.</p></div>'}`;
+  return `${pageHead('WORKFLOW STUDIO', 'Your workflows', 'Create separate processes for the credits, sources, and actions you monitor.', button('Create workflow', 'create-workflow', 'primary', 'plus'))}<div class="workflow-library">${state.workflows.map(w => `<article class="workflow-library-card"><div>${badge(w.active ? 'Active · demo' : 'Draft', w.active ? 'support-badge' : 'neutral')}<h2>${esc(w.name)}</h2><p>${w.steps.filter(s => s.type === 'watch' && !s.detached).length} sources · ${w.steps.length} steps · ${w.edges.length} connections</p></div><div class="workflow-card-actions"><button class="btn secondary" data-open-workflow="${w.id}">Open workflow ${icon('arrow')}</button><button class="btn danger subtle" data-remove-workflow="${w.id}" aria-label="Remove ${esc(w.name)}">${icon('trash')} Remove</button></div></article>`).join('')}</div>${state.workflows.length ? '' : '<div class="empty-state large"><h2>No workflows yet</h2><p>Create a workflow to start monitoring signals.</p></div>'}`;
 }
 function openWorkflow(id) {
+  selectedEdge=null;
   cancelSimulation();
   state.workflow = state.workflows.find(w => w.id === id);
   state.selectedWorkflowId = id;
@@ -124,69 +223,105 @@ function storyDetail(s) {
 }
 
 function workflowLayout() {
-  const steps = state.workflow.steps, sources = steps.filter(s => s.type === 'watch'), shared = steps.filter(s => !['watch', 'super'].includes(s.type));
-  const width = Math.max(950, sources.length * 305 + 40), positions = {};
-  sources.forEach((s, i) => positions[s.id] = { x: (width - (sources.length * 305 - 45)) / 2 + i * 305, y: 50 });
-  const join = steps.find(s => s.type === 'super');
-  if (join) positions[join.id] = { x: width / 2 - 130, y: 265 };
-  const match = steps.find(step => step.type === 'match');
-  if (match) positions[match.id] = { x: width / 2 - 130, y: 480 };
-  const context = steps.find(step => step.type === 'enrich'), branchY = context ? 1000 : 770;
-  if (context) positions[context.id] = { x: width / 2 - 130, y: 735 };
-  for (const branch of workflowBranches(steps)) branch.steps.forEach((step, index) => positions[step.id] = { x: (width - 950) / 2 + (branch.id === 'analysis' ? 95 : 595), y: branchY + index * 200 });
-  for (const step of steps) positions[step.id] = { x: step.x ?? positions[step.id]?.x ?? 35, y: step.y ?? positions[step.id]?.y ?? 50 };
-  return { width, branchY, height: Math.max(1000, ...Object.values(positions).map(p => p.y + 220)), positions };
+  const positions=Object.fromEntries(state.workflow.steps.map((s,i)=>[s.id,{x:s.x??60+(i%3)*320,y:s.y??60+Math.floor(i/3)*240}]));
+  return {positions,width:Math.max(1050,...Object.values(positions).map(p=>p.x+330)),height:Math.max(850,...Object.values(positions).map(p=>p.y+300))};
 }
 function sourceInspector(step) {
   const definition = sourceTypes[step.sourceType], config = sourceConfig(step), errors = sourceErrors(step);
-  return `<label class="form-label">Source name<input data-source-field="name" value="${esc(step.name)}" placeholder="Name this source" required maxlength="80"/>${errors.name ? `<small class="field-error">${errors.name}</small>` : ''}</label><label class="form-label">Source type<select id="source-type">${Object.entries(sourceTypes).map(([key, type]) => `<option value="${key}" ${key === step.sourceType ? 'selected' : ''}>${type.label}</option>`).join('')}</select></label>${definition.fields.map(field => `<label class="form-label">${field.label}<span>${field.required || field.options ? 'Required' : 'Optional'}</span>${field.options ? `<select data-source-field="${field.key}">${field.options.map(option => `<option ${config[field.key] === option ? 'selected' : ''}>${esc(option)}</option>`).join('')}</select>` : `<input data-source-field="${field.key}" type="${field.type || 'text'}" value="${esc(config[field.key] || '')}" placeholder="${esc(field.placeholder || '')}" ${field.required ? 'required' : ''}/>`}${errors[field.key] ? `<small class="field-error">${errors[field.key]}</small>` : ''}</label>`).join('')}<div class="source-connection-note">${icon('network')} Connected to Create / update Super Signal</div><p class="field-source">Sample configuration only. No content is fetched or email account connected.</p>`;
+  return `<label class="form-label">Source name<input data-source-field="name" value="${esc(step.name)}" placeholder="Name this source" required maxlength="80"/>${errors.name ? `<small class="field-error">${errors.name}</small>` : ''}</label><label class="form-label">Source type<select id="source-type">${Object.entries(sourceTypes).map(([key, type]) => `<option value="${key}" ${key === step.sourceType ? 'selected' : ''}>${type.label}</option>`).join('')}</select></label>${definition.fields.map(field => `<label class="form-label">${field.label}<span>${field.required || field.options ? 'Required' : 'Optional'}</span>${field.options ? `<select data-source-field="${field.key}">${field.options.map(option => `<option ${config[field.key] === option ? 'selected' : ''}>${esc(option)}</option>`).join('')}</select>` : `<input data-source-field="${field.key}" type="${field.type || 'text'}" value="${esc(config[field.key] || '')}" placeholder="${esc(field.placeholder || '')}" ${field.required ? 'required' : ''}/>`}${errors[field.key] ? `<small class="field-error">${errors[field.key]}</small>` : ''}</label>`).join('')}<div class="source-connection-note">${icon('network')} Connect this source to a Super Signal card</div><p class="field-source">Sample configuration only. No content is fetched or email account connected.</p>`;
 }
+function signalTypesInspector(step) {
+  const selected = selectedSignalTypes(step);
+  return `<fieldset class="dataset-picker"><legend>Signals to monitor</legend><p class="field-source">Choose one or more. Incoming evidence is grouped by issuer and signal type.</p>${catalog.super.options.map(type => `<label><input type="checkbox" data-signal-type="${esc(type)}" ${selected.includes(type) ? 'checked' : ''}/><span><strong>${esc(type)}</strong></span></label>`).join('')}${selected.length ? '' : '<p class="field-error">Select at least one signal.</p>'}</fieldset>`;
+}
+function simulationSignalKey(sourceId) { return JSON.stringify([sourceId, canvasSimulation.signalType]); }
+app.addEventListener('change', event => {
+  if (event.target.id === 'simulation-signal-type') { canvasSimulation.signalType = event.target.value; paintSimulation(); return; }
+  if (!event.target.dataset.signalType) return;
+  const step = state.workflow.steps.find(step => step.id === selectedStep);
+  if (!['super','route'].includes(step?.type)) return;
+  const selected = step.type === 'route' ? routeSignalTypes(state.workflow,step) : selectedSignalTypes(step);
+  const types = event.target.checked ? [...selected,event.target.dataset.signalType] : selected.filter(type=>type!==event.target.dataset.signalType);
+  setGraphSignalTypes(state.workflow,step,types);
+  save(); renderView();
+});
+function aiInspector(step) {
+  const datasets = graphAnalysisContext(state.workflow, step);
+  return `<label class="form-label">Analysis prompt<textarea id="ai-prompt" rows="9" placeholder="What should the AI investigate?" required>${esc(step.prompt)}</textarea>${step.prompt?.trim() ? '' : '<small class="field-error">Enter an analysis prompt.</small>'}</label><div class="inspector-hint"><p>Uses this Super Signal and evidence, plus context from earlier enrichment on this path. Other routes’ data is excluded.</p></div><div class="analysis-context"><h3>Available context</h3><p>Super Signal and source evidence</p>${datasets.map(d => `<p>${esc(d.label)}</p>`).join('') || '<p>No earlier enrichment. Add enrichment before this step to include internal data.</p>'}</div>${button('Preview analysis', 'preview-ai', 'secondary', 'sparkles')}<p class="field-source">Add a publishing step after this card to deliver the analysis. Sample output only; no AI service is called.</p>`;
+}
+function publicationContentSettings(step) {
+  const available = graphUpstreamAnalysis(state.workflow, step);
+  return `<label class="form-label">Content to publish<select id="publish-content"><option value="summary" ${step.publishing.content !== 'analysis' ? 'selected' : ''}>Super Signal summary</option><option value="analysis" ${step.publishing.content === 'analysis' ? 'selected' : ''}>AI analysis</option></select></label>${step.publishing.content === 'analysis' ? `<label class="form-label">Analysis output<select id="publish-analysis"><option value="">Select an earlier AI Analysis step</option>${available.map((s, i) => `<option value="${s.id}" ${s.id === step.publishing.analysisStepId ? 'selected' : ''}>AI Analysis ${i + 1} · ${esc(s.prompt?.slice(0, 45))}</option>`).join('')}</select></label>${available.some(s => s.id === step.publishing.analysisStepId) ? '' : '<p class="field-error">Add or select an earlier AI Analysis step on this path.</p>'}` : ''}`;
+}
+function aiPreview(step) {
+  const datasets = graphAnalysisContext(state.workflow, step);
+  const route = null;
+  return `<div class="info-banner">Illustrative analysis, not generated by AI. Editing the prompt changes the saved instructions, not this sample narrative. No email or desktop publication is sent.</div><details class="publish-trace" open><summary>Saved analyst prompt</summary><p>${esc(step.prompt)}</p></details><article class="publication-sample"><div class="eyebrow">SAMPLE AI ANALYSIS · ASTER AUTOMOTIVE</div><h3>${esc(route?.signalType || 'Credit impact')}</h3><p>${route?.signalType === 'Margin compression' ? 'Rising costs could put pressure on margins if price increases lag. Assess pricing power, cost pass-through, and cash-flow sensitivity before drawing a credit conclusion.' : 'The incoming evidence indicates potential credit pressure. Assess the timing of the development, available financial buffers, and sensitivity to adverse assumptions before drawing a credit conclusion.'}</p><h4>Context supplied to this step</h4>${datasets.map(d => `<p><strong>${esc(d.label)}</strong>: ${esc(d.values)}<br><small>${esc(d.source)} · As of ${d.asOf}</small></p>`).join('') || '<p>Super Signal evidence only. No enriched datasets available.</p>'}<h4>Uncertainty and next steps</h4><p>Validate data freshness, reconcile conflicting evidence, and identify missing inputs. This sample does not establish a rating action or an approved scenario result.</p></article>`;
+}
+app.addEventListener('input', event => {
+  if (event.target.id !== 'ai-prompt') return;
+  const step = state.workflow.steps.find(s => s.id === selectedStep);
+  step.prompt = event.target.value; state.workflow.active = false; save();
+});
+app.addEventListener('change', event => {
+  if (event.target.id === 'ai-prompt') { renderView(); return; }
+  if (!['publish-content', 'publish-analysis'].includes(event.target.id)) return;
+  const step = state.workflow.steps.find(s => s.id === selectedStep);
+  if (event.target.id === 'publish-content') { step.publishing.content = event.target.value; step.publishing.analysisStepId = graphUpstreamAnalysis(state.workflow, step).at(-1)?.id || ''; }
+  else step.publishing.analysisStepId = event.target.value;
+  state.workflow.active = false; save(); renderView();
+});
 function publishingInspector(step) {
   const config = step.publishing, errors = publishingErrors(step);
-  return `<label class="form-label">Publishing platform<select id="step-value">${catalog.publish.options.map(platform => `<option ${step.value === platform ? 'selected' : ''}>${platform}</option>`).join('')}</select></label><label class="form-label">Summarization prompt<textarea id="summary-prompt" data-publish-field="prompt" required>${esc(config.prompt)}</textarea>${errors.prompt ? `<small class="field-error">${errors.prompt}</small>` : ''}</label><button class="text-button prompt-reset" data-action="reset-summary-prompt">Restore default prompt</button>${step.value === 'Email' ? `<div class="email-publishing"><label class="form-label">To<input type="email" data-publish-field="to" value="${esc(config.to)}" placeholder="analyst@example.com" required/>${errors.to ? `<small class="field-error">${errors.to}</small>` : ''}</label><p class="field-source">Defaults to your sample profile: ${esc(state.user.email)}. You can change it.</p><div class="section-title recipient-heading"><h3>Additional recipients</h3><span>Optional</span></div>${config.additionalRecipients.map((email, index) => `<div class="recipient-row"><label class="form-label">Recipient ${index + 2}<input type="email" data-publish-recipient="${index}" value="${esc(email)}" placeholder="colleague@example.com" required/>${errors['recipient-' + index] ? `<small class="field-error">${errors['recipient-' + index]}</small>` : ''}</label><button class="icon-button" data-remove-recipient="${index}" aria-label="Remove recipient ${index + 2}">${icon('close')}</button></div>`).join('')}${button('Add recipient', 'add-publish-recipient', 'secondary compact', 'plus')}</div>` : `<div class="inspector-hint">${icon('briefcase')}<p>The summary is intended for your Analytical Desktop workspace, linked to the Super Signal and its source evidence.</p></div>`}<div class="inspector-hint">${icon('sparkles')}<p>This step can follow the portfolio filter directly. Scenario inputs and assumption review are not required for a summary.</p></div>${button('Preview publication', 'preview-publication', 'secondary', 'book')}<p class="field-source">Prototype only. No AI request, desktop publication, or email is sent.</p>`;
+  return `${publicationContentSettings(step)}<label class="form-label">Publishing platform<select id="step-value">${catalog.publish.options.map(platform => `<option ${step.value === platform ? 'selected' : ''}>${platform}</option>`).join('')}</select></label>${config.content === 'analysis' ? '<p class="field-source">Deliver the selected AI analysis with its source references and context. No second summarization prompt is applied.</p>' : `<label class="form-label">Summarization prompt<textarea id="summary-prompt" data-publish-field="prompt" required>${esc(config.prompt)}</textarea>${errors.prompt ? `<small class="field-error">${errors.prompt}</small>` : ''}</label><button class="text-button prompt-reset" data-action="reset-summary-prompt">Restore default prompt</button>`}${step.value === 'Email' ? `<div class="email-publishing"><label class="form-label">To<input type="email" data-publish-field="to" value="${esc(config.to)}" placeholder="analyst@example.com" required/>${errors.to ? `<small class="field-error">${errors.to}</small>` : ''}</label><p class="field-source">Defaults to your sample profile: ${esc(state.user.email)}. You can change it.</p><div class="section-title recipient-heading"><h3>Additional recipients</h3><span>Optional</span></div>${config.additionalRecipients.map((email, index) => `<div class="recipient-row"><label class="form-label">Recipient ${index + 2}<input type="email" data-publish-recipient="${index}" value="${esc(email)}" placeholder="colleague@example.com" required/>${errors['recipient-' + index] ? `<small class="field-error">${errors['recipient-' + index]}</small>` : ''}</label><button class="icon-button" data-remove-recipient="${index}" aria-label="Remove recipient ${index + 2}">${icon('close')}</button></div>`).join('')}${button('Add recipient', 'add-publish-recipient', 'secondary compact', 'plus')}</div>` : `<div class="inspector-hint">${icon('briefcase')}<p>The summary is intended for your Analytical Desktop workspace, linked to the Super Signal and its source evidence.</p></div>`}<div class="inspector-hint">${icon('sparkles')}<p>This step can follow the portfolio filter directly. Scenario inputs and assumption review are not required for a summary.</p></div>${button('Preview publication', 'preview-publication', 'secondary', 'book')}<p class="field-source">Prototype only. No AI request, desktop publication, or email is sent.</p>`;
 }
 function publicationPreview(step) {
+  if (step.publishing.content === 'analysis') {
+    const analysis = graphUpstreamAnalysis(state.workflow, step).find(s => s.id === step.publishing.analysisStepId);
+    const errors = Object.values(publishingErrors(step));
+    if (!analysis) errors.push('Choose an earlier AI Analysis step on this path.');
+    if (errors.length) return `<div class="validation-box">${errors.map(e => `<p>${esc(e)}</p>`).join('')}</div>`;
+    return `<div class="publication-route"><strong>${esc(step.value)}</strong><p>${step.value === 'Email' ? 'To: ' + esc(publishingRecipients(step).join(', ')) : 'Your Analytical Desktop workspace'}</p></div>${aiPreview(analysis)}`;
+  }
   const errors = Object.values(publishingErrors(step));
   if (errors.length) return `<div class="validation-box"><h3>Complete the publishing settings</h3>${errors.map(message => `<p>${esc(message)}</p>`).join('')}</div>${button('Back to settings', 'close-modal')}`;
   const story = stories[0];
   return `<div class="info-banner">${icon('book')} Illustrative content only. Your edited prompt is saved for execution in a full implementation; it is not run in this prototype.</div><div class="publication-route"><strong>${esc(step.value)}</strong><p>${step.value === 'Email' ? 'To: ' + esc(publishingRecipients(step).join(', ')) : 'Workspace: European corporates · Super Signal: Aster Automotive'}</p></div><details class="publish-trace"><summary>Summarization prompt</summary><p>${esc(step.publishing.prompt)}</p></details><article class="publication-sample"><div class="eyebrow">SAMPLE SUPER SIGNAL SUMMARY</div><h3>${story.issuer}: ${story.mechanism}</h3><p>${story.summary}</p><p>${story.rationale}</p><h4>Evidence and uncertainty</h4><ul>${story.evidence.map(e => `<li>${esc(e.text)} <small>${esc(e.source)} · ${esc(e.reference)}</small></li>`).join('')}</ul><p>This is a potential credit implication, not a rating action. The available liquidity partly offsets the pressure and requires analyst judgment.</p></article><div class="modal-actions">${button('Back to settings', 'close-modal')}</div><p class="modal-disclaimer">Delivery is simulated; no external publication or email is created.</p>`;
 }
-function branchInspector() {
-  return `<div class="inspector-hint"><p>Enrich once before these paths split. Both paths receive the same dated context.</p></div>${button(state.workflow.steps.some(s => s.type === 'enrich') ? 'Configure shared enrichment' : 'Add shared enrichment', 'add-enrichment', 'secondary', 'layers')}<div class="branch-picker"><h3>Paths for portfolio matches</h3><p>Choose one or both. Each path receives the same Super Signal.</p>${['analysis', 'summary'].map(id => { const path = workflowBranches(state.workflow.steps).find(branch => branch.id === id); return `<button class="branch-choice" data-action="add-path-${id}"><span class="node-icon ${id === 'analysis' ? 'purple' : 'teal'}">${icon(id === 'analysis' ? 'chart' : 'book')}</span><span><strong>${id === 'analysis' ? 'Extract Scenario Inputs' : 'Summarize and Publish'}</strong><small>${path ? path.steps.length + ' steps · Configure path' : 'Add this path'}</small></span>${icon(path ? 'chevron' : 'plus')}</button>`; }).join('')}</div>`;
+function routingInspector(step){
+  const available=selectedSignalTypes(state.workflow.steps.find(s=>s.type==='super'));
+  const selected=routeSignalTypes(state.workflow,step);
+  return `<div class="inspector-hint"><p>Select the signal types to route, then connect each named output to its first step. Only the matching output runs.</p></div><fieldset class="dataset-picker"><legend>Signal types to route</legend>${available.map(type=>`<label><input type="checkbox" data-signal-type="${esc(type)}" ${selected.includes(type)?'checked':''}/><span><strong>${esc(type)}</strong></span></label>`).join('')}</fieldset><p class="field-source">${available.length?'Available types come from Signals to monitor on Super Signal. To monitor another type, add it there first. Routing choices only affect this routing step. Signals without a selected, connected route stop here.':'Select signal types on the Super Signal card first.'}</p>${available.length&&!selected.length?'<p class="field-error">Select at least one signal type to route.</p>':''}`;
 }
-function branchCanvasControls(layout) {
-  return ['analysis', 'summary'].map(id => {
-    const exists = workflowBranches(state.workflow.steps).some(branch => branch.id === id), x = (layout.width - 950) / 2 + (id === 'analysis' ? 95 : 595);
-    return `<div class="branch-lane-label" style="left:${x}px;top:${layout.branchY - 60}px"><span>${id === 'analysis' ? 'A · SCENARIO ANALYSIS' : 'B · SUMMARY & PUBLISHING'}</span><small>${exists ? 'Runs independently on portfolio match' : 'Optional path'}</small></div>${!exists ? `<button class="empty-branch" style="left:${x}px;top:${layout.branchY}px" data-action="add-path-${id}">${icon('plus')}<strong>${id === 'analysis' ? 'Extract Scenario Inputs' : 'Summarize and Publish'}</strong><span>Add this path from Match my portfolio</span></button>` : ''}`;
-  }).join('');
-}
+
 function workflowView() {
-  const w = state.workflow, step = w.steps.find(s => s.id === selectedStep), info = step && catalog[step.type], layout = workflowLayout();
-  const sources = w.steps.filter(s => s.type === 'watch'), shared = w.steps.filter(s => !['watch', 'super'].includes(s.type));
-  const branch = step && workflowBranches(w.steps).find(branch => branch.id === branchOf(step));
-  const branchSteps = branch?.steps || [], stepIndex = branchSteps.indexOf(step), canMove = stepIndex > 0;
-  return `${pageHead('DESIGNED BY YOU', 'Many sources. One credit workflow.', 'Filter to your portfolio, then summarize, analyze, or follow both paths.', button('Preview flow', 'preview', 'secondary', 'play') + button('Try signal arrivals', 'try-signal-arrivals', 'secondary', 'radio') + button(w.active ? 'Pause workflow' : 'Activate workflow', 'activate', w.active ? 'secondary' : 'primary', w.active ? 'clock' : 'check'))}
-  <div class="workflow-shell"><div class="workflow-toolbar"><div><button class="workflow-name" data-action="rename">${esc(w.name)} ${icon('settings')}</button>${badge(w.active ? 'Active · demo' : 'Draft', w.active ? 'support-badge' : 'neutral')}<small>Saved in this browser</small></div><div class="workflow-add-buttons">${button('Add source', 'add-workflow-source', 'secondary compact', 'radio')}${button('Add step', 'add-step', 'secondary compact', 'plus')}</div></div><section id="simulation-panel" class="simulation-panel" ${canvasSimulation.open ? '' : 'hidden'}>${simulationPanel()}</section><div class="workflow-body"><div class="canvas-scroll"><div class="canvas-tip">${icon('network')} ${sources.length} source${sources.length === 1 ? '' : 's'} → Super Signal → portfolio filter <span>Drag to arrange · Select to configure</span></div><div class="canvas" style="width:${layout.width * zoom}px;height:${layout.height * zoom}px"><div class="canvas-inner" style="width:${layout.width}px;transform:scale(${zoom});height:${layout.height}px"><svg id="connections" aria-hidden="true"></svg><div class="canvas-stage-label" style="top:15px;width:${layout.width}px">01 · YOUR SOURCES</div><div class="canvas-stage-label" style="top:445px;width:${layout.width}px">02 · PORTFOLIO FILTER</div>${w.steps.map((node, i) => {
-    const c = catalog[node.type], pos = layout.positions[node.id], isSource = node.type === 'watch', needsSetup = isSource ? Object.keys(sourceErrors(node)).length : node.type === 'enrich' ? Object.keys(enrichmentErrors(node)).length : node.type === 'publish' && Object.keys(publishingErrors(node)).length;
-    return `<button class="flow-node ${selectedStep === node.id ? 'selected' : ''} ${node.type === 'super' ? 'join-node' : isSource ? 'source-node' : ''}" data-step="${node.id}" style="left:${pos.x}px;top:${pos.y}px"><div class="node-heading"><span class="node-icon ${c.color}">${icon(isSource ? sourceTypes[node.sourceType].icon : c.icon)}</span><span class="node-category">${isSource ? sourceTypes[node.sourceType].label : c.category}</span><span class="node-number">${isSource ? 'SOURCE' : node.type === 'super' ? 'SUPER' : node.type === 'match' ? 'FILTER' : node.type === 'enrich' ? 'CONTEXT' : (branchOf(node) === 'analysis' ? 'A' : 'B') + (workflowBranches(w.steps).find(branch => branch.id === branchOf(node)).steps.indexOf(node) + 1)}</span></div><h3>${esc(isSource ? node.name || 'Untitled source' : c.label)}</h3><p>${esc(isSource ? sourceSummary(node) : node.type === 'super' ? sources.length + ' sources · deduplication built in' : node.type === 'enrich' ? node.enrichment.datasets.length + ' datasets · shared context' : node.value)}</p><div class="node-footer"><span class="node-status ${needsSetup ? 'needs-setup' : ''}"></span>${needsSetup ? 'Needs configuration' : node.type === 'review' ? 'Analyst checkpoint' : node.type === 'super' ? 'First arrival creates · repeats update' : 'Configured'}<span class="node-menu">•••</span></div>${isSource ? '' : '<span class="port port-in"></span>'}<span class="port port-out"></span></button>`;
-  }).join('')}<div class="filter-stop" style="left:${layout.width / 2 + 175}px;top:480px"><span>${icon('close')} Not in portfolio</span><strong>Stop here</strong><p>No downstream analysis or inbox task</p></div>${branchCanvasControls(layout)}<div class="flow-end" style="top:${layout.height - 35}px;width:${layout.width}px">${icon('check')} Every source follows the same credit process</div></div></div><div class="canvas-controls"><button class="icon-button" data-action="zoom-out" aria-label="Zoom out">−</button><span>${Math.round(zoom * 100)}%</span><button class="icon-button" data-action="zoom-in" aria-label="Zoom in">+</button><span class="vertical-line"></span><button class="text-button" data-action="arrange">Auto arrange</button></div></div><aside class="step-inspector">${step ? `<div class="inspector-label">${step.type === 'watch' ? 'SOURCE CONFIGURATION' : step.type === 'super' ? 'SUPER SIGNAL LIFECYCLE' : step.type === 'match' ? 'PORTFOLIO FILTER & BRANCHES' : step.type === 'enrich' ? 'SHARED CREDIT CONTEXT' : (branch?.label || 'Processing') + ' · STEP ' + (stepIndex + 1)}</div><span class="inspector-icon ${info.color}">${icon(step.type === 'watch' ? sourceTypes[step.sourceType].icon : info.icon)}</span><h2>${step.type === 'watch' ? 'Configure source' : info.label}</h2><p>${info.description}</p>${step.type === 'watch' ? sourceInspector(step) : step.type === 'enrich' ? enrichmentInspector(step) : step.type === 'publish' ? publishingInspector(step) : step.type === 'super' ? `<div class="join-source-list">${sources.length ? sources.map(source => `<div>${icon(sourceTypes[source.sourceType].icon)}<span>${esc(source.name)}</span>${icon('check')}</div>`).join('') : '<p>Add a source to start this flow.</p>'}</div>${button('Add another source', 'add-workflow-source', 'secondary', 'plus')}<label class="form-label">${info.field}<select id="step-value">${info.options.map(option => `<option ${option === step.value ? 'selected' : ''}>${option}</option>`).join('')}</select></label><p class="field-source">Group by issuer + credit topic. Repeat identity: source + source signal identifier.</p><div class="inspector-hint">${icon('network')}<p>The first arrival creates a Super Signal for the issuer and credit topic. A new signal joins it; the same source emitting identical content is stopped here with no version change. Changed content updates the existing entry to v2 and continues. Source references and previous versions are retained.</p></div>` : `<label class="form-label">${info.field}<select id="step-value">${info.options.map(option => `<option ${option === step.value ? 'selected' : ''}>${option}</option>`).join('')}</select></label>`}<label class="form-label">Analyst guidance <span>Optional</span><textarea id="step-note" placeholder="What should this step pay attention to?">${esc(step.note)}</textarea></label>${step.type === 'match' ? `${branchInspector()}<div class="inspector-hint">${icon('briefcase')}<p>In portfolio → follow each configured path independently. A review pause on the analysis path does not pause publishing.<br>Not in portfolio → stop this workflow. The Super Signal is retained, but no inbox review or downstream action is created for this portfolio.</p></div>` : ''}${step.type === 'review' ? `<div class="inspector-hint">${icon('inbox')}<p>Review tasks arrive on the affected story in the analyst’s inbox.</p></div>` : ''}${canMove ? `<div class="step-order"><span>Order within this path</span><button class="btn secondary compact" data-action="move-up" ${stepIndex <= 1 ? 'disabled' : ''}>↑</button><button class="btn secondary compact" data-action="move-down" ${stepIndex === branchSteps.length - 1 ? 'disabled' : ''}>↓</button></div>` : ''}${branch ? button('Add next step', 'add-branch-step', 'secondary', 'plus') : ''}${stepIndex === 0 && branchSteps.length > 1 ? '<p class="field-source">Remove the later steps before removing this path’s first step.</p>' : ''}${!['super', 'match'].includes(step.type) && !(stepIndex === 0 && branchSteps.length > 1) ? button(step.type === 'watch' ? 'Remove source' : 'Remove step', 'remove-step', 'danger subtle', 'trash') : ''}` : '<h2>Choose a step</h2><p>Select a source or processing step to configure it.</p>'}</aside></div><div class="workflow-bottom"><span>${icon('layers')} ${sources.length} sources <span>·</span> ${shared.length} shared steps <span>·</span> Sample adapters</span><span>${icon('check')} Changes saved automatically</span></div></div>`;
+  const w=state.workflow,layout=workflowLayout(),step=w.steps.find(s=>s.id===selectedStep);
+  const edge=w.edges.find(e=>e.id===selectedEdge);
+  const inspector=edge?`<h2>Connection</h2><p>${esc(catalog[w.steps.find(s=>s.id===edge.from)?.type]?.label)} → ${esc(catalog[w.steps.find(s=>s.id===edge.to)?.type]?.label)}</p>${edge.condition?`<p>Signal: ${esc(edge.condition)}</p>`:''}${button('Remove connection','remove-edge','danger','trash')}<p class="field-source">Both cards remain in place.</p>`:step?graphStepInspector(step):'<h2>Build your workflow</h2><p>Add cards, position them, then connect output dots to input dots. Select an arrow to remove it.</p><p class="field-source">Multiple outputs from a normal step run in parallel. Routing selects one named signal path.</p>';
+  return `${pageHead('WORKFLOW STUDIO',w.name,'Cards and arrows define exactly what runs.',button('Check workflow','preview','secondary','check')+button('Try signal arrivals','try-signal-arrivals','secondary','play')+button(w.active?'Pause workflow':'Activate workflow','activate',w.active?'secondary':'primary','check'))}
+  <div class="workflow-shell"><div class="workflow-toolbar"><div>${button('Rename','rename','secondary compact','settings')}${badge(w.active?'Active · demo':'Draft',w.active?'support-badge':'neutral')}</div><div class="workflow-add-buttons"><button class="btn secondary compact" data-action="undo-graph" ${histories.get(w.id)?.length?'':'disabled'}>Undo</button>${button('Add step','add-step','primary compact','plus')}</div></div><section id="simulation-panel" class="simulation-panel" ${canvasSimulation.open?'':'hidden'}>${simulationPanel()}</section><div class="workflow-body"><div class="canvas-scroll"><div class="canvas-tip">Drag cards to position · Connect output → input · Select an arrow to remove it</div><div class="canvas" style="width:${layout.width*zoom}px;height:${layout.height*zoom}px"><div class="canvas-inner" style="width:${layout.width}px;height:${layout.height}px;transform:scale(${zoom})"><svg id="connections"></svg>${w.steps.length?'':`<div class="graph-empty"><h2>Start with a source</h2><p>Add the steps you need, then connect them.</p>${button('Add step','add-step','primary','plus')}</div>`}${w.steps.map(node=>{const c=catalog[node.type],pos=layout.positions[node.id];return `<button class="flow-node ${selectedStep===node.id?'selected':''}" data-step="${node.id}" style="left:${pos.x}px;top:${pos.y}px"><div class="node-heading"><span class="node-icon ${c.color}">${icon(c.icon)}</span><span class="node-category">${c.category}</span></div><h3>${esc(node.type==='watch'?node.name||'Source':c.label)}</h3><p>${esc(node.type==='watch'?sourceSummary(node):node.type==='enrich'?enrichmentCardSummary(node):node.type==='super'?selectedSignalTypes(node).join(', '):node.value)}</p><div class="node-footer">${w.edges.some(e=>e.from===node.id||e.to===node.id)?'Connected':'Not connected'}</div>${node.type==='watch'?'':'<span class="port port-in"></span>'}<span class="port port-out"></span></button>`;}).join('')}</div></div><div class="canvas-controls">${button('−','zoom-out','secondary compact')}${Math.round(zoom*100)}%${button('+','zoom-in','secondary compact')}${button('Auto arrange','arrange','secondary compact')}</div></div><aside class="step-inspector">${inspector}</aside></div></div>`;
 }
-function drawConnections() {
-  const svg = document.querySelector('#connections'); if (!svg) return;
-  const nodes = new Map([...document.querySelectorAll('.flow-node')].map(node => [node.dataset.step, node]));
-  const matchStep = state.workflow.steps.find(s => s.type === 'match'), matchNode = matchStep && nodes.get(matchStep.id), stopNode = document.querySelector('.filter-stop');
-  svg.innerHTML = '<defs><marker id="arrowhead" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto"><path d="M0 0L7 3.5L0 7" fill="none" stroke="#94a7c0"/></marker></defs>' + workflowEdges(state.workflow.steps).map(edge => {
-    const node = nodes.get(edge.from), next = nodes.get(edge.to); if (!node || !next) return '';
-    const x = parseFloat(node.style.left), y = parseFloat(node.style.top), nx = parseFloat(next.style.left), ny = parseFloat(next.style.top); let d;
-    if (Math.abs(ny - y) > 100) {
-      const down = ny > y, sy = y + (down ? 145 : 0), ey = ny + (down ? -6 : 151), mid = (sy + ey) / 2;
-      d = `M${x + 130},${sy} C${x + 130},${mid} ${nx + 130},${mid} ${nx + 130},${ey}`;
-    } else if (nx > x) d = `M${x + 260},${y + 73} C${x + 285},${y + 73} ${nx - 25},${ny + 73} ${nx - 6},${ny + 73}`;
-    else d = `M${x},${y + 73} C${x - 25},${y + 73} ${nx + 285},${ny + 73} ${nx + 266},${ny + 73}`;
-    return `<path data-from="${edge.from}" data-to="${edge.to}" d="${d}" fill="none" stroke="#a8b8cb" stroke-width="1.6" marker-end="url(#arrowhead)"/>`;
-  }).join('');
-  if (matchNode && stopNode) { const x = parseFloat(matchNode.style.left) + 260, y = parseFloat(matchNode.style.top) + 73, nx = parseFloat(stopNode.style.left), ny = parseFloat(stopNode.style.top) + 60; svg.innerHTML += `<path data-filter="excluded" d="M${x},${y} C${x + 20},${y} ${nx - 20},${ny} ${nx - 5},${ny}" fill="none" stroke="#c1a18b" stroke-dasharray="4 3" marker-end="url(#arrowhead)"/>`; }
+function graphStepInspector(step){
+  const info=catalog[step.type];
+  const settings=step.type==='watch'?sourceInspector(step):step.type==='enrich'?enrichmentInspector(step):step.type==='ai'?aiInspector(step):step.type==='publish'?publishingInspector(step):step.type==='super'?signalTypesInspector(step):step.type==='route'?routingInspector(step):`<label class="form-label">${info.field}<select id="step-value">${info.options.map(v=>`<option ${v===step.value?'selected':''}>${esc(v)}</option>`).join('')}</select></label>`;
+  return `<div class="inspector-label">STEP SETTINGS</div><h2>${info.label}</h2><p>${info.description}</p>${settings}<label class="form-label">Analyst guidance<textarea id="step-note">${esc(step.note)}</textarea></label>${step.type==='review'?'<p class="field-source">Human input required. Review takes place in the Signal Inbox.</p>':''}${button('Remove step','remove-step','danger','trash')}<p class="field-source">Removes this card and its arrows. Other cards stay in place. Undo restores it.</p>`;
 }
+
+function drawConnections(){
+  const svg=document.querySelector('#connections');if(!svg)return;
+  for(const options of document.querySelectorAll('.node-output-options')){const node=document.querySelector('[data-step="'+options.dataset.outputFor+'"]');if(node){options.style.left=node.style.left;options.style.top=(parseFloat(node.style.top)+node.offsetHeight+8)+'px';}}
+  const canvas=document.querySelector('.canvas-inner'),frame=canvas.getBoundingClientRect();
+  svg.innerHTML='<defs>'+[undefined,...Object.keys(signalColors)].map((type,i)=>`<marker id="graph-arrow-${i}" markerWidth="8" markerHeight="8" refX="7" refY="4" orient="auto"><path d="M0 0L8 4L0 8" fill="${signalColor(type).line}"/></marker>`).join('')+'</defs>';
+  for(const e of state.workflow.edges){
+    const source=[...document.querySelectorAll('[data-connect-output]')].find(n=>n.dataset.connectOutput===e.from&&(n.dataset.connectRoute||undefined)===e.condition);
+    const target=document.querySelector('[data-connect-input="'+e.to+'"]');if(!source||!target)continue;
+    const a=source.getBoundingClientRect(),b=target.getBoundingClientRect(),x=(a.x+a.width/2-frame.x)/zoom,y=(a.y+a.height/2-frame.y)/zoom,nx=(b.x+b.width/2-frame.x)/zoom,ny=(b.y+b.height/2-frame.y)/zoom;
+    const d=`M${x},${y} C${x},${y+70} ${nx},${ny-70} ${nx},${ny}`;
+    const color=signalColor(e.condition).line,marker=Math.max(0,Object.keys(signalColors).indexOf(e.condition)+1);
+    svg.innerHTML+=`<path class="graph-edge ${selectedEdge===e.id?'selected-edge':''}" data-from="${e.from}" data-to="${e.to}" ${e.condition?`data-signal-type="${esc(e.condition)}" style="stroke:${color}"`:''} d="${d}" fill="none" stroke="${color}" stroke-width="2" marker-end="url(#graph-arrow-${marker})"/><path class="edge-hit" data-edge="${e.id}" d="${d}" fill="none" stroke="transparent" stroke-width="18" tabindex="0" role="button" aria-label="${esc(e.condition ? 'Select '+e.condition+' connection' : 'Select connection')}"/>`;
+  }
+}
+
 function sourcesView() { return `${pageHead('YOUR INFORMATION ECOSYSTEM', 'Different sources. One perspective.', 'Bring the information you trust into your own credit workflow.', button('Add a source', 'add-source', 'primary', 'plus'))}<div class="info-banner">${icon('radio')}<div><strong>Your sources, your way.</strong> Personal and team sources feed the same signal model. These connections are simulated in the prototype.</div></div><div class="source-grid">${state.sources.map(s => `<article class="source-card"><div class="source-card-top"><span class="source-icon">${icon(s.icon)}</span><button class="switch ${s.enabled ? 'on' : ''}" role="switch" aria-checked="${s.enabled}" aria-label="Enable ${esc(s.name)}" data-source-toggle="${s.id}"><span></span></button></div><h2>${esc(s.name)}</h2>${badge(s.kind, 'neutral')}<p>${esc(s.detail)}</p><div class="source-card-bottom"><span><i class="status-dot ${s.enabled ? 'connected' : ''}"></i>${s.enabled ? 'Enabled in preview' : 'Paused'}</span><small>${s.owner}</small></div></article>`).join('')}</div><div class="source-note">${icon('layers')} New sources plug into the same workflow—no process redesign required.</div>`; }
 function actionsView() { return `${pageHead('FROM INSIGHT TO FOLLOW-THROUGH', 'Put your perspective to work.', 'A clear record of reviews, assignments, and scenario explorations.', button('Create an action', 'take-action', 'primary', 'plus'))}<div class="action-summary">${badge(`${state.actions.filter(a => a.status === 'Open').length} open`, 'high')}${badge(`${state.actions.filter(a => a.status === 'Completed').length} completed`, 'support-badge')}<span>Actions are saved locally. No notifications are sent.</span></div>${state.actions.length ? `<div class="action-table"><div class="action-row table-header"><span>ACTION / CREDIT</span><span>OWNER</span><span>CREATED</span><span>STATUS</span></div>${state.actions.map(a => `<div class="action-row"><div><strong>${esc(a.title)}</strong><small>${esc(a.issuer)} · ${esc(a.type)}</small>${a.note ? `<p>${esc(a.note)}</p>` : ''}${a.runId ? `<button class="run-history-button" data-run-result="${a.runId}">View approved inputs & result</button>` : ''}</div><span>${esc(a.owner)}</span><span>${new Date(a.created).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })}</span><button ${a.runId ? 'disabled' : ''} class="badge action-status ${a.status === 'Completed' ? 'support-badge' : 'high'}" data-complete="${a.id}" title="Toggle completion">${a.status === 'Completed' ? icon('check') : icon('clock')}${a.status}</button></div>`).join('')}</div>` : `<div class="empty-state large"><span class="empty-icon">${icon('clipboard')}</span><h2>Your next action starts with a signal.</h2><p>Explore a credit story, run a scenario, or assign a focused review.<br>Your follow-through will appear here.</p>${button('Explore the signal inbox', 'nav-inbox', 'primary', 'arrow')}</div>`}`; }
 
@@ -194,17 +329,18 @@ function openModal(type, payload) { modal = { type, payload }; renderModal(); }
 function closeModal() { document.querySelector('#modal-root').innerHTML = ''; modal = null; }
 function renderModal() {
   if (!modal) return; const s = getStory(); let title = '', subtitle = '', body = '', wide = false;
+  if (modal.type === 'ai-preview') { title = 'AI Analysis preview'; subtitle = 'Illustrative output · Your prompt is saved but not executed'; wide = true; body = aiPreview(state.workflow.steps.find(s => s.id === modal.payload)); }
   if (modal.type === 'remove-workflow') {
     const workflow = state.workflows.find(w => w.id === modal.payload); if (!workflow) { closeModal(); return; }
     title = 'Remove workflow?'; subtitle = esc(workflow.name);
     body = `<p>Remove this workflow and its saved configuration from this browser? This cannot be undone. Existing inbox reviews and action history will remain.</p><div class="modal-actions">${button('Keep workflow', 'close-modal', 'secondary')}${button('Remove workflow', 'confirm-remove-workflow', 'danger', 'trash')}</div>`;
   }
-  if (modal.type === 'create-workflow') { title = 'Create a workflow'; subtitle = 'Choose a starting point, then configure your sources and steps.'; body = `<form id="create-workflow-form"><label class="form-label">Workflow name<input name="name" required maxlength="80" placeholder="e.g. Liquidity risk monitor"/></label><label class="form-label">Starting point<select name="template"><option value="blank">Basic flow · sources, Super Signal & portfolio filter</option><option value="analysis">Scenario analysis · extraction, review & scenario</option><option value="summary">Summarize and Publish</option></select></label><p class="field-source">New workflows start as drafts. Configure the source and choose your portfolio before activation.</p><button type="submit" class="btn primary">Create workflow</button></form>`; }
+  if (modal.type === 'create-workflow') { title = 'Create a workflow'; subtitle = 'Choose a starting point, then configure your sources and steps.'; body = `<form id="create-workflow-form"><label class="form-label">Workflow name<input name="name" required maxlength="80" placeholder="e.g. Liquidity risk monitor"/></label><label class="form-label">Starting point<select name="template"><option value="blank">Blank workflow · empty canvas</option><option value="basic">Template · source, Super Signal & portfolio</option><option value="routed">Template · refinancing & margin analysis</option><option value="analysis">Scenario analysis · extraction, review & scenario</option><option value="summary">Summarize and Publish</option></select></label><p class="field-source">New workflows start as drafts. Configure the source and choose your portfolio before activation.</p><button type="submit" class="btn primary">Create workflow</button></form>`; }
   if (modal.type === 'evidence') { const e = s.evidence[modal.payload]; title = e.title; subtitle = `${e.source} · ${e.time} · Illustrative evidence`; body = `${badge(e.role + ' this credit story', e.role === 'Supports' ? 'support-badge' : 'mixed-badge')}<blockquote>${e.text}</blockquote><div class="fact-row"><span>${e.fact}</span><strong>${e.value}</strong></div><p class="muted">Evidence reference: ${e.reference}</p><div class="info-banner">${icon('layers')} ${e.duplicates} report${e.duplicates > 1 ? 's are' : ' is'} represented by this signal. Source repetition does not increase evidence confidence.</div><p class="modal-disclaimer">Sample content created for this prototype; this is not a live source excerpt.</p>`; }
   if (modal.type === 'priority') { title = 'Adjust story priority'; subtitle = s.issuer; body = `<form id="priority-form"><label class="form-label">Queue priority<select name="priority">${['Critical', 'High', 'Medium', 'Low'].map(p => `<option ${priority(s) === p ? 'selected' : ''}>${p}</option>`).join('')}</select></label><label class="form-label">Why is this priority appropriate?<textarea name="reason" required placeholder="Explain your portfolio-specific assessment…">${esc(state.overrides[s.id]?.reason || '')}</textarea></label><p class="muted">Your override changes queue priority. The original importance, severity, and urgency remain visible.</p><button class="btn primary" type="submit">Save assessment</button></form>`; }
   if (modal.type === 'take-action') { title = 'Move the analysis forward'; subtitle = `Create a local action for ${s.issuer}`; body = `<form id="action-form"><label class="form-label">Action<select name="type"><option>Event-driven credit review</option><option>Assign further analysis</option><option>Monitor at next committee</option></select></label><label class="form-label">Owner<select name="owner"><option>Alex Laurent</option><option>Jamie Chen</option><option>Priya Shah</option></select></label><label class="form-label">Analysis question<textarea name="note" required placeholder="What needs to be investigated?">Assess ${s.mechanism.toLowerCase()} and implications for the credit outlook.</textarea></label><p class="muted">The action will appear in your Action center. No external job or notification is created.</p><button class="btn primary" type="submit">${icon('plus')} Create action</button></form>`; }
   if (modal.type === 'scenario') { title = 'Explore the credit impact'; subtitle = `${s.issuer} · Illustrative interest coverage sensitivity`; wide = true; const debt = s.id === 'aster' ? 1200 : ''; body = `<div class="scenario-layout"><form id="scenario-form"><div class="eyebrow">REVIEW YOUR ASSUMPTIONS</div><label class="form-label">Debt to refinance <span>€ million</span><input name="debt" type="number" min="0" step="any" value="${debt}" required placeholder="Enter an analyst assumption"/></label><p class="field-source">${s.id === 'aster' ? 'Evidence: sample debt schedule · €1.2bn within 18 months' : 'Not available in sample evidence. Analyst input required.'}</p><label class="form-label">Additional refinancing spread <span>basis points</span><input name="shock" type="number" min="0" max="2000" step="1" value="150" required/></label><p class="field-source">Analyst-defined downside assumption, not an extracted fact.</p><div class="two-fields"><label class="form-label">Baseline EBITDA (€m)<input name="ebitda" type="number" min="0.01" step="any" value="480" required/></label><label class="form-label">Baseline interest (€m)<input name="interest" type="number" min="0.01" step="any" value="120" required/></label></div><p class="field-source">Illustrative baseline assumptions. Replace before interpretation.</p><label class="checkbox-label"><input name="approved" type="checkbox" required/> I have reviewed these inputs for this demo.</label><button class="btn primary" type="submit">${icon('play')} Calculate sensitivity</button></form><div id="scenario-output" class="scenario-output"><span class="empty-icon">${icon('chart')}</span><h3>Make the assumptions explicit.</h3><p>Review the inputs, then explore how additional interest expense changes coverage.</p><div class="formula">Coverage = EBITDA ÷ interest expense</div></div></div><p class="modal-disclaimer">Simplified annual sensitivity: all selected debt refinances at the added spread; EBITDA and other interest stay constant. This is not a rating model.</p>`; }
-  if (modal.type === 'add-step') { title = 'What happens next?'; subtitle = 'Start a path from the portfolio filter, or add a step to an existing path.'; wide = true; body = `<label class="form-label branch-destination">Add downstream steps to<select id="add-step-branch"><option value="analysis" ${addBranch === 'analysis' ? 'selected' : ''}>Scenario analysis path</option><option value="summary" ${addBranch === 'summary' ? 'selected' : ''}>Summary & publishing path</option></select></label><p class="field-source">Extract Scenario Inputs starts the analysis path. Summarize and Publish starts the publishing path. Enrich credit context is shared before the split. Other steps extend the selected path.</p><div class="step-catalog">${Object.entries(catalog).filter(([type]) => !['watch', 'match'].includes(type)).map(([type, c]) => `<button class="catalog-card" data-add-step="${type}"><span class="node-icon ${c.color}">${icon(c.icon)}</span><strong>${c.label}</strong><p>${c.description}</p><span>${['super', 'enrich'].includes(type) && state.workflow.steps.some(step => step.type === type) ? 'Already in flow · Configure' : c.category} ${icon(['super', 'enrich'].includes(type) && state.workflow.steps.some(step => step.type === type) ? 'settings' : 'plus')}</span></button>`).join('')}</div>`; }
+  if (modal.type === 'add-step') { title = 'Add a step'; subtitle = 'Choose a card, place it on the canvas, then connect its input to a workflow output.'; wide = true; body = `<div class="step-catalog">${Object.entries(catalog).map(([type,c]) => `<button class="catalog-card" data-add-step="${type}"><span class="node-icon ${c.color}">${icon(c.icon)}</span><strong>${c.label}</strong><p>${c.description}</p><span>Add unconnected ${icon('plus')}</span></button>`).join('')}</div>`; }
   if (modal.type === 'rename') { title = 'Name your workflow'; subtitle = 'Give this process a name your team will recognize.'; body = `<form id="rename-form"><label class="form-label">Workflow name<input name="name" maxlength="80" value="${esc(state.workflow.name)}" required/></label><button class="btn primary" type="submit">Save name</button></form>`; }
   if (modal.type === 'add-source') { title = 'Bring another source into view'; subtitle = 'Add a simulated adapter to your information ecosystem.'; body = `<form id="source-form"><label class="form-label">Source name<input name="name" placeholder="e.g. Sector research newsletter" maxlength="70" required/></label><label class="form-label">Source type<select name="kind"><option>Email</option><option>News feed</option><option>Subscription</option><option>Policy & regulatory</option><option>Internal</option></select></label><label class="form-label">What should this source watch?<input name="detail" placeholder="Topics, issuers, or a publication" required/></label><p class="muted">This adds a sample connection. It does not authenticate with or retrieve content from a provider.</p><button class="btn primary" type="submit">Add sample source</button></form>`; }
   if (modal.type === 'assumption-review') { title = 'Review the assumptions'; subtitle = `${stories.find(s => s.id === modalRun()?.storyId)?.issuer || ''} · ${esc(modalRun()?.workflowName)} · Inbox review`; wide = true; body = assumptionReviewBody(); }
@@ -237,16 +373,18 @@ function simulationPanel() {
   if (!canvasSimulation.open) return '';
   const sources = state.workflow.steps.filter(step => step.type === 'watch');
   if (!sources.some(source => source.id === canvasSimulation.sourceId)) canvasSimulation.sourceId = sources[0]?.id || '';
-  const previous = canvasSimulation.latestBySource[canvasSimulation.sourceId];
+  const types = selectedSignalTypes(state.workflow.steps.find(step => step.type === 'super'));
+  if (!types.includes(canvasSimulation.signalType)) canvasSimulation.signalType = types[0];
+  const previous = canvasSimulation.latestBySource[simulationSignalKey(canvasSimulation.sourceId)];
   const disabled = canvasSimulation.running ? 'disabled' : '';
-  return `<div class="simulation-heading"><span>${icon('play')} SIGNAL ARRIVAL SIMULATION</span><small>Sample data · No inbox tasks, AI calls, or publishing</small><button class="icon-button" data-action="sim-close" aria-label="Close simulation">${icon('close')}</button></div><div class="simulation-controls"><label>From source<select id="simulation-source" ${disabled}>${sources.map(source => `<option value="${source.id}" ${source.id === canvasSimulation.sourceId ? 'selected' : ''}>${esc(source.name)}</option>`).join('')}</select></label><button class="btn primary compact" data-action="sim-new" ${disabled}>${icon('radio')} Send new signal</button><button class="btn secondary compact" data-action="sim-duplicate" ${disabled || (!previous ? 'disabled' : '')}>Replay unchanged</button><button class="btn secondary compact" data-action="sim-update" ${disabled || (!previous ? 'disabled' : '')}>Send update${previous ? ' · v' + (previous.revision + 1) : ''}</button><button class="btn secondary compact" data-action="sim-outside" ${disabled}>Outside portfolio</button><button class="text-button" data-action="${canvasSimulation.running ? 'sim-stop' : 'sim-reset'}">${canvasSimulation.running ? 'Stop animation' : 'Reset simulation'}</button></div><div class="simulation-feedback"><p id="simulation-status" role="status" aria-live="polite">${esc(canvasSimulation.status || 'Choose an arrival and watch its path through your workflow.')}</p><span>${canvasSimulation.deliveries} arrivals · ${canvasSimulation.signals.reduce((sum, signal) => sum + signal.signals.length, 0)} signals${canvasSimulation.version ? ' · latest v' + canvasSimulation.version : ''}</span></div>${canvasSimulation.log.length ? `<details class="simulation-log"><summary>Arrival trace (${canvasSimulation.log.length})</summary><ol>${canvasSimulation.log.map(message => `<li>${esc(message)}</li>`).join('')}</ol></details>` : ''}`;
+  return `<div class="simulation-heading"><span>${icon('play')} SIGNAL ARRIVAL SIMULATION</span><small>Sample data · No inbox tasks, AI calls, or publishing</small><button class="icon-button" data-action="sim-close" aria-label="Close simulation">${icon('close')}</button></div><div class="simulation-controls"><label>From source<select id="simulation-source" ${disabled}>${sources.map(source => `<option value="${source.id}" ${source.id === canvasSimulation.sourceId ? 'selected' : ''}>${esc(source.name)}</option>`).join('')}</select></label><label>Signal<select id="simulation-signal-type" ${disabled}>${types.map(type => `<option ${type === canvasSimulation.signalType ? 'selected' : ''}>${esc(type)}</option>`).join('')}</select></label><button class="btn primary compact" data-action="sim-new" ${disabled}>${icon('radio')} Send new signal</button><button class="btn secondary compact" data-action="sim-duplicate" ${disabled || (!previous ? 'disabled' : '')}>Replay unchanged</button><button class="btn secondary compact" data-action="sim-update" ${disabled || (!previous ? 'disabled' : '')}>Send update${previous ? ' · v' + (previous.revision + 1) : ''}</button><button class="btn secondary compact" data-action="sim-outside" ${disabled}>Outside portfolio</button><button class="text-button" data-action="${canvasSimulation.running ? 'sim-stop' : 'sim-reset'}">${canvasSimulation.running ? 'Stop animation' : 'Reset simulation'}</button></div><div class="simulation-feedback"><p id="simulation-status" role="status" aria-live="polite">${esc(canvasSimulation.status || 'Choose an arrival and watch its path through your workflow.')}</p><span>${canvasSimulation.deliveries} arrivals · ${canvasSimulation.signals.reduce((sum, signal) => sum + signal.signals.length, 0)} signals${canvasSimulation.version ? ' · latest v' + canvasSimulation.version : ''}</span></div>${canvasSimulation.log.length ? `<details class="simulation-log"><summary>Arrival trace (${canvasSimulation.log.length})</summary><ol>${canvasSimulation.log.map(message => `<li>${esc(message)}</li>`).join('')}</ol></details>` : ''}`;
 }
 function paintSimulation() {
   const panel = document.querySelector('#simulation-panel');
   if (panel) { panel.innerHTML = simulationPanel(); panel.hidden = !canvasSimulation.open; panel.dataset.running = String(canvasSimulation.running); }
   for (const node of document.querySelectorAll('.flow-node, .filter-stop')) {
     const id = node.dataset.step || 'filtered-out', status = canvasSimulation.nodes[id];
-    node.classList.remove('sim-active', 'sim-passed', 'sim-stopped', 'sim-paused');
+    node.classList.remove('sim-active', 'sim-passed', 'sim-stopped', 'sim-paused', 'sim-skipped');
     node.querySelector('.sim-node-tag')?.remove();
     delete node.dataset.simState;
     if (status) {
@@ -269,7 +407,7 @@ function cancelSimulation(message = 'Animation stopped. Send another arrival whe
 }
 function resetSimulation() {
   cancelSimulation();
-  Object.assign(canvasSimulation, { signals: [], latestBySource: {}, nextId: 1, deliveries: 0, nodes: {}, edges: {}, log: [], version: null, signature: JSON.stringify(state.workflow.steps), status: 'Simulation reset. The next arrival creates v1.' });
+  Object.assign(canvasSimulation, { signals: [], latestBySource: {}, nextId: 1, deliveries: 0, nodes: {}, edges: {}, log: [], version: null, signature: JSON.stringify(state.workflow), status: 'Simulation reset. The next arrival creates v1.' });
   paintSimulation();
 }
 function simulationNode(id, status, label) {
@@ -314,122 +452,71 @@ async function travelSimulationEdge(from, to, token, excluded = false) {
   if (!simulationAlive(token)) return false;
   canvasSimulation.edges[key] = 'passed'; paintSimulation(); return true;
 }
-async function runCanvasArrival(kind = 'new') {
-  if (canvasSimulation.running) return;
-  canvasSimulation.open = true;
-  if (canvasSimulation.signature !== JSON.stringify(state.workflow.steps)) resetSimulation();
-  const errors = validateWorkflow(state.workflow.steps);
-  if (errors.length) { canvasSimulation.status = 'Complete the workflow before simulating: ' + errors.join(' '); paintSimulation(); return; }
-  const source = state.workflow.steps.find(step => step.id === canvasSimulation.sourceId && step.type === 'watch') || state.workflow.steps.find(step => step.type === 'watch');
-  canvasSimulation.sourceId = source.id;
-  const previous = canvasSimulation.latestBySource[source.id];
-  if ((kind === 'duplicate' || kind === 'update') && !previous) { canvasSimulation.status = 'Send a new signal from this source first.'; paintSimulation(); return; }
-  const superStep = state.workflow.steps.find(step => step.type === 'super'), match = state.workflow.steps.find(step => step.type === 'match');
-  const signal = kind === 'duplicate' || kind === 'update' ? { ...previous, receivedAt: new Date().toISOString(), ...(kind === 'update' ? { content: `Updated credit evidence, revision ${previous.revision + 1}`, facts: { ...previous.facts, refinancingSpreadBps: 150 + previous.revision * 25 } } : {}) } : { sourceId: source.id, sourceName: source.name, signalId: `signal-${canvasSimulation.nextId++}`, issuerId: kind === 'outside' ? 'uncovered' : 'aster', topic: superStep.value, content: kind === 'outside' ? 'Uncovered Co sample refinancing evidence' : 'Aster sample refinancing evidence', facts: { refinancingSpreadBps: 150 }, receivedAt: new Date().toISOString() };
-  const token = ++canvasSimulation.token;
-  canvasSimulation.running = true; canvasSimulation.nodes = {}; canvasSimulation.edges = {}; canvasSimulation.log = []; canvasSimulation.version = null;
-  simulationLog(`${source.name}: ${kind === 'duplicate' ? 'unchanged replay' : kind === 'update' ? 'changed content' : 'new signal'} ${signal.signalId}.`);
-  try {
-    if (!await visitSimulationNode(source, token, 'Signal received')) return;
-    if (!await travelSimulationEdge(source.id, superStep.id, token)) return;
-    // Only arrivals that actually reach the aggregate change simulation state.
-    const received = receiveSignal(canvasSimulation.signals, signal);
-    canvasSimulation.signals = received.superSignals; canvasSimulation.deliveries++;
-    const member = received.superSignal.signals.find(item => item.sourceId === signal.sourceId && item.signalId === signal.signalId);
-    canvasSimulation.latestBySource[source.id] = structuredClone(member); canvasSimulation.version = member.revision;
-    const label = received.outcome === 'duplicate' ? `Duplicate · v${member.revision} unchanged` : received.outcome === 'updated' ? `Updated to v${member.revision} · continue` : `Signal v${member.revision} · ${received.outcome === 'created' ? 'Super Signal created' : 'added to Super Signal'}`;
-    simulationLog(received.outcome === 'duplicate' ? 'Stopped at Super Signal: identical content. Version unchanged; nothing sent downstream.' : label);
-    if (!await visitSimulationNode(superStep, token, label, received.shouldContinue ? 'passed' : 'stopped')) return;
-    if (!received.shouldContinue) return;
-    if (!await travelSimulationEdge(superStep.id, match.id, token)) return;
-    // Fixed demo coverage: Aster is covered by every selectable portfolio, Uncovered Co is not.
-    const covered = matchesPortfolio(received.superSignal, ['aster']);
-    simulationLog(covered ? `Matched ${match.value}; sending v${member.revision} to each configured path.` : `Not in ${match.value}; stopped at portfolio filter.`);
-    if (!await visitSimulationNode(match, token, covered ? 'In portfolio · continue' : 'Not in portfolio · stop', covered ? 'passed' : 'stopped')) return;
-    if (!covered) {
-      if (await travelSimulationEdge(match.id, '', token, true)) simulationNode('filtered-out', 'stopped', 'Filtered out · no downstream actions');
-      return;
+async function runCanvasArrival(kind='new'){
+  if(canvasSimulation.running)return;
+  canvasSimulation.open=true;
+  if(canvasSimulation.signature!==JSON.stringify(state.workflow))resetSimulation();
+  const errors=simulationErrors(state.workflow,canvasSimulation.sourceId);if(errors.length){canvasSimulation.status=errors.join(' ');paintSimulation();return;}
+  const w=state.workflow,source=w.steps.find(s=>s.id===canvasSimulation.sourceId)||w.steps.find(s=>s.type==='watch');
+  canvasSimulation.sourceId=source.id;
+  const prior=canvasSimulation.latestBySource[simulationSignalKey(source.id)];
+  if(['duplicate','update'].includes(kind)&&!prior){toast('Send a new signal first.');return;}
+  const signal=['duplicate','update'].includes(kind)?{...prior,receivedAt:new Date().toISOString(),...(kind==='update'?{content:'Updated evidence '+(prior.revision+1)}:{})}:{sourceId:source.id,sourceName:source.name,signalId:'arrival-'+canvasSimulation.nextId++,issuerId:kind==='outside'?'uncovered':'aster',topic:canvasSimulation.signalType,content:'Sample '+canvasSimulation.signalType+' evidence',facts:{sample:true},receivedAt:new Date().toISOString()};
+  const token=++canvasSimulation.token;canvasSimulation.running=true;canvasSimulation.nodes={};canvasSimulation.edges={};canvasSimulation.log=[];canvasSimulation.deliveries++;
+  async function visit(step){
+    if(!simulationAlive(token))return;
+    let label=catalog[step.type].label+' · simulated',status='passed',stop=false;
+    if(step.type==='super'){
+      const received=receiveSignal(canvasSimulation.signals,signal);canvasSimulation.signals=received.superSignals;
+      const member=received.superSignal.signals.find(s=>s.sourceId===signal.sourceId&&s.signalId===signal.signalId);
+      canvasSimulation.latestBySource[simulationSignalKey(source.id)]=structuredClone(member);canvasSimulation.version=member.revision;
+      stop=!received.shouldContinue;status=stop?'stopped':'passed';label=stop?'Duplicate · stop':'Super Signal v'+member.revision;simulationLog(label);
     }
-    const context = state.workflow.steps.find(step => step.type === 'enrich');
-    if (context) {
-      if (!await travelSimulationEdge(match.id, context.id, token)) return;
-      const snapshot = enrichmentSnapshot(context);
-      simulationLog(`Shared context: ${snapshot.datasets.length} datasets; ${snapshot.issues.length} stale or missing. Sample snapshot ${snapshot.retrievedAt}.`);
-      if (!await visitSimulationNode(context, token, snapshot.paused ? 'Data review needed · paths paused' : snapshot.issues.length ? 'Context attached · quality flags' : 'Shared context attached', snapshot.paused ? 'paused' : 'passed')) return;
-      if (snapshot.paused) { canvasSimulation.status = 'Paused at enrichment for data review. Neither downstream path has run.'; paintSimulation(); return; }
-    }
-    const endings = await Promise.all(workflowBranches(state.workflow.steps).map(async branch => {
-      let from = context?.id || match.id;
-      for (const step of branch.steps) {
-        if (!await travelSimulationEdge(from, step.id, token)) return '';
-        const needsReview = step.type === 'review';
-        const label = needsReview ? `v${member.revision} · awaiting analyst review` : step.type === 'publish' ? 'Publishing simulated · no delivery' : `${catalog[step.type].label} · simulated`;
-        if (!await visitSimulationNode(step, token, label, needsReview ? 'paused' : 'passed')) return '';
-        if (needsReview) { simulationLog(`${branch.label} paused at Review assumptions. Later nodes on this path have not run.`); return `${branch.label}: awaiting review`; }
-        from = step.id;
-      }
-      simulationLog(`${branch.label} completed in simulation.`); return `${branch.label}: completed`;
+    if(step.type==='match'&&signal.issuerId!=='aster'){stop=true;status='stopped';label='Outside portfolio · stop';}
+    if(step.type==='enrich'){const snapshot=graphSnapshot(w,step);label=snapshot.datasets.length+' context datasets';if(snapshot.paused){stop=true;status='paused';label='Data review needed';}}
+    if(step.type==='review'){stop=true;status='paused';label='Awaiting analyst review in inbox';}
+    if(step.type==='ai')label='AI analysis prepared · sample output';
+    if(step.type==='publish')label=(step.publishing.content==='analysis'?'AI analysis':'Summary')+' → '+step.value+' · simulated';
+    const outgoing=w.edges.filter(e=>e.from===step.id);
+    if(!stop&&step.type==='route'&&!outgoing.some(e=>e.condition===signal.topic)){stop=true;status='stopped';label='No connected route for '+signal.topic;simulationLog(label);}
+    if(!stop&&!outgoing.length&&!['publish','scenario','assign','job'].includes(step.type)){stop=true;status='stopped';label='No next step connected';simulationLog(catalog[step.type].label+': '+label);}
+    if(!await visitSimulationNode(step,token,label,status)||stop)return;
+    await Promise.all(outgoing.map(async e=>{
+      if(step.type==='route'&&e.condition!==signal.topic){simulationNode(e.to,'skipped','Other signal type');return;}
+      if(await travelSimulationEdge(e.from,e.to,token))await visit(w.steps.find(s=>s.id===e.to));
     }));
-    if (simulationAlive(token)) { canvasSimulation.status = endings.filter(Boolean).join(' · '); paintSimulation(); }
-  } catch (error) {
-    if (simulationAlive(token)) { canvasSimulation.status = 'Simulation could not finish: ' + error.message; paintSimulation(); }
-  } finally {
-    if (canvasSimulation.token === token) { canvasSimulation.running = false; paintSimulation(); }
   }
+  try{await visit(source);if(simulationAlive(token)){canvasSimulation.status='Simulation complete. '+(Object.values(canvasSimulation.nodes).some(n=>n.state==='stopped')?'See the stopped card and arrival trace for where this signal ended.':'Paused steps await human input; only visible connections were followed.');paintSimulation();}}
+  catch(error){canvasSimulation.status=error.message;}
+  finally{if(canvasSimulation.token===token){canvasSimulation.running=false;paintSimulation();}}
 }
 
-function previewBody() {
-  const errors = validateWorkflow(state.workflow.steps);
-
-  if (errors.length) return `<div class="validation-box"><h3>A few things to connect first</h3>${errors.map(e => `<p>• ${esc(e)}</p>`).join('')}</div>${button('Back to workflow', 'close-modal', 'primary')}`;
-  const descriptions = { watch: 'Normalize incoming information and preserve source context', super: 'Create on first arrival; stop unchanged duplicates; update and forward new versions only when content changes', enrich: 'Attach selected internal datasets with source references and as-of dates before both paths split. Apply the configured missing/stale data policy.', match: 'Portfolio matches enter every configured path. Unmatched Super Signals stop here.', extract: 'Prepare source-linked scenario inputs', review: 'Pause this path for assumptions review in the inbox', scenario: 'Run a scenario using approved inputs', assign: 'Create an analysis assignment', job: 'Create a credit review', publish: 'Summarize and publish to the selected platform (simulated)' };
-  function traceRow(step, waiting = false, checkpoint = false) {
-    return `<div class="trace-row ${waiting ? 'waiting' : ''}"><span class="trace-icon">${icon(waiting ? 'clock' : 'check')}</span><div><strong>${esc(step.type === 'watch' ? step.name : catalog[step.type].label)}</strong><p>${descriptions[step.type]}</p><small>${esc(step.type === 'watch' ? sourceSummary(step) : step.value)}</small>${step.type === 'publish' ? `<details class="publish-trace"><summary>Publishing configuration</summary><p>${esc(step.publishing.prompt)}</p><small>${step.value === 'Email' ? 'To: ' + esc(publishingRecipients(step).join(', ')) : 'Destination: Analytical Desktop'}</small></details>` : ''}</div>${badge(waiting ? checkpoint ? 'Inbox checkpoint' : 'After approval' : 'Automatic', waiting ? 'neutral' : 'support-badge')}</div>`;
-  }
-  return `<div class="preview-notice">${icon('network')} Each configured path receives the matched Super Signal independently. Pausing analysis for review does not block the publishing path. Design preview only; no delivery or inbox tasks are created.</div><div class="run-trace">${state.workflow.steps.filter(step => !branchOf(step)).map(step => traceRow(step)).join('')}</div><div class="branch-preview-grid">${workflowBranches(state.workflow.steps).map(branch => { const reviewIndex = branch.steps.findIndex(step => step.type === 'review'); return `<section class="branch-preview"><h3>${branch.label}</h3>${branch.steps.map((step, index) => traceRow(step, reviewIndex >= 0 && index >= reviewIndex, index === reviewIndex)).join('')}</section>`; }).join('')}</div>${button('Go to signal inbox', 'open-inbox', 'primary', 'inbox')}`;
-
+function previewBody(){
+  const errors=validateGraph(state.workflow);
+  return errors.length?`<div class="validation-box"><h3>Complete these before activation</h3>${errors.map(e=>`<p>${esc(e)}</p>`).join('')}</div>`:`<div class="info-banner">Ready to simulate. Execution follows the ${state.workflow.edges.length} visible connections. Routing selects a signal output; other multiple outputs run in parallel.</div>`;
 }
 
 app.addEventListener('click', handleClick);
 document.querySelector('#modal-root').addEventListener('click', handleClick);
 function handleClick(event) {
-  const el = event.target.closest('button, a');
+  const el = event.target.closest('button, a, [data-edge]');
   if (!el) { if (event.target.classList.contains('modal-backdrop')) closeModal(); return; }
+
   if (el.dataset.openWorkflow) { openWorkflow(el.dataset.openWorkflow); return; }
   if (el.dataset.removeWorkflow) { openModal('remove-workflow', el.dataset.removeWorkflow); return; }
+  if (el.dataset.edge) {selectedEdge=el.dataset.edge;selectedStep=null;renderView();return;}
   if (el.dataset.story) { selected = el.dataset.story; renderView(); return; }
   if (el.dataset.filter) { filter = el.dataset.filter; renderView(); return; }
   if (el.dataset.evidence !== undefined) { openModal('evidence', Number(el.dataset.evidence)); return; }
   if (el.dataset.step) { if (suppressClick) return; selectWorkflowStep(el.dataset.step); return; }
-  if (el.dataset.addStep) {
-    const type = el.dataset.addStep;
-    if (type === 'enrich') { closeModal(); addEnrichment(); return; }
-    if (type === 'super') {
-      let step = state.workflow.steps.find(step => step.type === 'super');
-      if (!step) {
-        step = newStep('super');
-        const firstProcessing = state.workflow.steps.findIndex(step => step.type !== 'watch');
-        state.workflow.steps.splice(firstProcessing < 0 ? state.workflow.steps.length : firstProcessing, 0, step);
-        state.workflow.active = false; save();
-      }
-      selectedStep = step.id; closeModal(); renderView();
-      document.querySelector('.flow-node.selected')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-      toast('Configure the Super Signal that connects your sources.');
-      return;
-    }
-    if (type === 'extract' || type === 'publish') { closeModal(); ensureBranch(type === 'extract' ? 'analysis' : 'summary'); return; }
-    const path = workflowBranches(state.workflow.steps).find(branch => branch.id === addBranch);
-    if (!path) { toast('Start this path with Extract Scenario Inputs or Summarize and Publish first.'); return; }
-    const step = newStep(type, undefined, state.user.email); step.branch = addBranch;
-    const after = path.steps.find(step => step.id === modal?.payload?.afterId) || path.steps.at(-1);
-    state.workflow.steps.splice(state.workflow.steps.indexOf(after) + 1, 0, step);
-    selectedStep = step.id; state.workflow.active = false; save(); closeModal(); renderView(); toast('Step added to ' + path.label + '.'); return;
-  }
+  if (el.dataset.addStep) {const type=el.dataset.addStep;closeModal();addGraphCard(type);return;}
   if (el.dataset.sourceToggle) { const source = state.sources.find(s => s.id === el.dataset.sourceToggle); source.enabled = !source.enabled; save(); renderView(); return; }
   if (el.dataset.runResult) { const run = state.runs.find(r => r.id === el.dataset.runResult); if (run) { selected = run.storyId; openModal('run-result', run.id); } return; }
   if (el.dataset.complete) { const action = state.actions.find(a => a.id === el.dataset.complete); action.status = action.status === 'Open' ? 'Completed' : 'Open'; save(); renderView(); return; }
   if (el.dataset.removeRecipient !== undefined) { const step = state.workflow.steps.find(step => step.id === selectedStep); if (step?.type === 'publish') { step.publishing.additionalRecipients.splice(Number(el.dataset.removeRecipient), 1); state.workflow.active = false; save(); renderView(); } return; }
   const action = el.dataset.action;
+  if (action === 'preview-ai') { openModal('ai-preview', selectedStep); return; }
+
   if (action === 'confirm-remove-workflow' && modal?.type === 'remove-workflow') {
     const id = modal.payload, workflow = state.workflows.find(w => w.id === id);
     if (!workflow) return;
@@ -442,32 +529,24 @@ function handleClick(event) {
     }
     workflowLibrary = true; closeModal(); save(); renderView(); toast(`Removed “${workflow.name}”.`); return;
   }
-  if (action === 'add-enrichment') { addEnrichment(); return; }
+
   if (action === 'preview-enrichment') { openModal('enrichment-preview', selectedStep); return; } if (!action) return; event.preventDefault();
   if (action === 'create-workflow') { openModal('create-workflow'); return; }
   if (action === 'workflow-list') { workflowLibrary = true; renderView(); return; }
   if (action.startsWith('nav-')) { view = action.slice(4); if (view === 'workflow') workflowLibrary = true; shell(); return; }
   if (['evidence', 'priority', 'scenario', 'take-action', 'rename', 'add-source', 'portfolio', 'guide', 'reset'].includes(action)) { openModal(action); return; }
   if (action === 'add-step' || action === 'add-branch-step') {
-    const selectedNode = state.workflow.steps.find(step => step.id === selectedStep);
-    addBranch = branchOf(selectedNode || { type: 'match' }) || 'analysis';
-    openModal('add-step', action === 'add-branch-step' ? { afterId: selectedStep } : null);
+    openStepInsertion(selectedStep);
   }
-  if (action === 'add-path-analysis' || action === 'add-path-summary') ensureBranch(action === 'add-path-analysis' ? 'analysis' : 'summary');
+
   if (action === 'close-modal') closeModal();
   if (action === 'mark-reviewed') { state.reviewed = state.reviewed.includes(selected) ? state.reviewed.filter(id => id !== selected) : [...state.reviewed, selected]; save(); renderView(); }
   if (action === 'sort') toast('Stories are ordered Critical → High → Medium → Low. Adjust a story’s priority to change its position.');
-  if (action === 'add-workflow-source') {
-    const node = newSource(); const joinIndex = state.workflow.steps.findIndex(s => s.type === 'super');
-    state.workflow.steps.splice(joinIndex < 0 ? 0 : joinIndex, 0, node);
-    selectedStep = node.id; state.workflow.active = false;
-    state.workflow.steps.forEach(s => { delete s.x; delete s.y; });
-    save(); renderView(); toast('Source added and connected to the Super Signal. Choose its type and settings.');
-  }
+  if (action === 'add-workflow-source') { addGraphCard('watch'); return; }
   if (action === 'try-signal-arrivals') {
     canvasSimulation.open = true; renderView();
     document.querySelector('#simulation-panel')?.scrollIntoView({ block: 'nearest' });
-    requestAnimationFrame(() => { drawConnections(); runCanvasArrival(canvasSimulation.latestBySource[canvasSimulation.sourceId] ? 'duplicate' : 'new'); });
+    requestAnimationFrame(() => { drawConnections(); runCanvasArrival('new'); });
   }
   if (['sim-new', 'sim-duplicate', 'sim-update', 'sim-outside'].includes(action)) runCanvasArrival(action.slice(4));
   if (action === 'sim-stop') cancelSimulation();
@@ -482,6 +561,7 @@ function handleClick(event) {
     state.workflow.active = false; save(); renderView();
     if (action === 'add-publish-recipient') document.querySelector('[data-publish-recipient="' + (step.publishing.additionalRecipients.length - 1) + '"]')?.focus();
   }
+
   if (action === 'preview') openModal('preview');
   if (action === 'open-inbox') { closeModal(); view = 'inbox'; filter = 'All signals'; selected = 'aster'; shell(); }
   if (action === 'inbox-review' || action === 'inbox-result') {
@@ -494,41 +574,18 @@ function handleClick(event) {
     state.runs.unshift(createInboxRun()); save(); renderView();
     toast('Sample arrival processed. Aster is awaiting a fresh review; previous results are retained in the Action center.');
   }
-  if (action === 'activate') { const errors = validateWorkflow(state.workflow.steps); if (errors.length) { openModal('preview'); return; } state.workflow.active = !state.workflow.active; save(); renderView(); toast(state.workflow.active ? 'Workflow activated in this demo. Live monitoring requires a backend.' : 'Workflow paused.'); }
-  if (action === 'move-up' || action === 'move-down') {
-    const steps = state.workflow.steps, node = steps.find(step => step.id === selectedStep), shared = workflowBranches(steps).find(branch => branch.id === branchOf(node))?.steps || [];
-    const i = shared.findIndex(s => s.id === selectedStep), j = i + (action === 'move-up' ? -1 : 1);
-    if (i > 0 && j > 0 && j < shared.length) {
-      const first = steps.indexOf(shared[i]), second = steps.indexOf(shared[j]);
-      [steps[first], steps[second]] = [steps[second], steps[first]];
-      steps.forEach(s => { delete s.x; delete s.y; }); state.workflow.active = false; save(); renderView();
-    }
-  }
-  if (action === 'remove-step') {
-    if (['super', 'match'].includes(state.workflow.steps.find(s => s.id === selectedStep)?.type)) return;
-    const node = state.workflow.steps.find(s => s.id === selectedStep), path = workflowBranches(state.workflow.steps).find(branch => branch.id === branchOf(node));
-    if (path?.steps[0].id === selectedStep && path.steps.length > 1) { toast('Remove the later steps before removing this path’s first step.'); return; }
-    state.workflow.steps = state.workflow.steps.filter(s => s.id !== selectedStep);
-    selectedStep = state.workflow.steps[0]?.id; state.workflow.active = false;
-    state.workflow.steps.forEach(s => { delete s.x; delete s.y; }); save(); renderView();
-  }
+  if (action === 'activate') { const errors = validateGraph(state.workflow); if (errors.length) { openModal('preview'); return; } state.workflow.active = !state.workflow.active; save(); renderView(); toast(state.workflow.active ? 'Workflow activated in this demo. Live monitoring requires a backend.' : 'Workflow paused.'); }
+  if (action === 'remove-step') { removeGraphStep(state.workflow,selectedStep);selectedStep=null;selectedEdge=null;save();renderView();return; }
+  if (action === 'remove-edge') { state.workflow.edges=state.workflow.edges.filter(e=>e.id!==selectedEdge);selectedEdge=null;state.workflow.active=false;save();renderView();return; }
+  if (action === 'undo-graph') {undoGraph();return;}
+
   if (action === 'zoom-in' || action === 'zoom-out') { zoom = Math.min(1.2, Math.max(0.5, Math.round((zoom + (action === 'zoom-in' ? .1 : -.1)) * 10) / 10)); renderView(); }
-  if (action === 'arrange') { state.workflow.steps.forEach(s => { delete s.x; delete s.y; }); save(); renderView(); }
-  if (action === 'confirm-reset') { state = initialState(); initializeWorkflows(); workflowLibrary = true; selectedStep = state.workflow.steps[0].id; selected = 'aster'; query = ''; filter = 'All signals'; closeModal(); save(); shell(); toast('Sample workspace reset.'); }
+  if (action === 'arrange') { arrangeGraph(); save(); renderView(); }
+  if (action === 'confirm-reset') { state = initialState(); initializeWorkflows(); workflowLibrary = true; selectedStep = state.workflow?.steps[0]?.id; selected = 'aster'; query = ''; filter = 'All signals'; closeModal(); save(); shell(); toast('Sample workspace reset.'); }
   if (action === 'save-scenario') { if (!modal.payload) return; addAction({ type: 'Scenario exploration', title: 'Refinancing downside sensitivity', note: modal.payload, owner: 'Alex Laurent' }); closeModal(); toast('Scenario result saved to the Action center.'); }
   if (action === 'export-story') { const s = getStory(); const blob = new Blob([JSON.stringify({ ...s, priority: priority(s), override: state.overrides[s.id], disclaimer: 'Illustrative prototype data, not actual credit research.' }, null, 2)], { type: 'application/json' }); const url = URL.createObjectURL(blob), a = document.createElement('a'); a.href = url; a.download = `${s.id}-credit-story.json`; a.click(); setTimeout(() => URL.revokeObjectURL(url), 1000); toast('Credit story exported with evidence and context.'); }
 }
-function ensureBranch(id) {
-  let path = workflowBranches(state.workflow.steps).find(branch => branch.id === id);
-  if (!path) {
-    const root = newStep(id === 'analysis' ? 'extract' : 'publish', undefined, state.user.email);
-    root.branch = id; state.workflow.steps.push(root); state.workflow.active = false;
-    state.workflow.steps.forEach(step => { delete step.x; delete step.y; }); save();
-    path = { steps: [root] };
-  }
-  selectedStep = path.steps[0].id; renderView();
-  document.querySelector('.flow-node.selected')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
-}
+
 function addAction(fields) { state.actions.unshift({ ...fields, id: crypto.randomUUID(), issuer: getStory().issuer, storyId: selected, created: new Date().toISOString(), status: 'Open' }); save(); shell(); }
 function updatePublishingField(event) {
   const field = event.target.dataset.publishField, recipient = event.target.dataset.publishRecipient;
@@ -540,7 +597,6 @@ function updatePublishingField(event) {
 }
 app.addEventListener('change', event => { if (event.target.id === 'simulation-source') { canvasSimulation.sourceId = event.target.value; paintSimulation(); } });
 app.addEventListener('input', event => { if (canvasSimulation.running && event.target.closest('.step-inspector')) cancelSimulation('Settings changed. Restart the simulation to use the new configuration.'); });
-document.querySelector('#modal-root').addEventListener('change', event => { if (event.target.id === 'add-step-branch') addBranch = event.target.value; });
 app.addEventListener('input', updatePublishingField);
 app.addEventListener('change', event => {
   if (event.target.dataset.publishField || event.target.dataset.publishRecipient !== undefined) { updatePublishingField(event); renderView(); }
@@ -577,8 +633,7 @@ document.querySelector('#modal-root').addEventListener('submit', e => {
   e.preventDefault(); const f = new FormData(e.target);
   if (e.target.id === 'create-workflow-form') {
     const name = f.get('name').trim(); if (!name || !e.target.reportValidity()) return;
-    const types = f.get('template') === 'analysis' ? ['extract', 'review', 'scenario'] : f.get('template') === 'summary' ? ['publish'] : [];
-    const workflow = { id: crypto.randomUUID(), schemaVersion: 4, name, active: false, steps: [newSource('web'), newStep('super'), newStep('match'), ...types.map(type => newStep(type, undefined, state.user.email))] };
+    const workflow = createGraph(name, f.get('template'), state.user.email);
     state.workflows.push(workflow); closeModal(); openWorkflow(workflow.id); toast('Workflow created. Configure your source to get started.'); return;
   }
   if (e.target.id === 'assumption-review-form') {
@@ -613,32 +668,27 @@ document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal()
 save();
 shell();
 
-function addEnrichment() {
-  let step = state.workflow.steps.find(s => s.type === 'enrich');
-  if (!step) {
-    step = newStep('enrich');
-    state.workflow.steps.splice(state.workflow.steps.findIndex(s => s.type === 'match') + 1, 0, step);
-    state.workflow.steps.forEach(s => { delete s.x; delete s.y; });
-    state.workflow.active = false; save();
-  }
-  selectedStep = step.id; renderView();
-  document.querySelector('.flow-node.selected')?.scrollIntoView({block:'nearest', inline:'nearest'});
+
+function enrichmentCardSummary(step) {
+  const selection = graphSelection(state.workflow, step);
+  return `${selection.inherited.length} inherited · ${selection.additional.length} additional`;
 }
 function enrichmentInspector(step) {
   const config = step.enrichment;
-  return `<div class="inspector-hint"><p>After portfolio matching, before the split. Extraction and publishing use the same context snapshot.</p></div><fieldset class="dataset-picker"><legend>Internal datasets</legend>${enrichmentDatasets.map(d => `<label><input type="checkbox" data-enrichment-dataset="${d.id}" ${config.datasets.includes(d.id) ? 'checked' : ''}/><span><strong>${d.label}</strong><small>${d.description}</small></span></label>`).join('')}</fieldset><label class="form-label">Flag data older than<select data-enrichment-field="maxAgeDays">${[30,90,180,365].map(n => `<option value="${n}" ${config.maxAgeDays === n ? 'selected' : ''}>${n} days</option>`).join('')}</select></label><label class="form-label">If data is stale or missing<select data-enrichment-field="issues"><option value="flag" ${config.issues === 'flag' ? 'selected' : ''}>Flag and continue</option><option value="pause" ${config.issues === 'pause' ? 'selected' : ''}>Pause for data review</option></select></label><p class="field-source">Missing values stay empty. Historical assumptions remain context until an analyst approves their use. Freshness is measured from each dataset’s as-of date.</p>${Object.values(enrichmentErrors(step)).map(e => `<p class="field-error">${esc(e)}</p>`).join('')}${button('Preview selected data', 'preview-enrichment', 'secondary', 'book')}<p class="field-source">Sample adapters only. No internal systems are queried.</p>`;
+  return `<div class="inspector-hint"><p>${'Uses datasets from earlier connected enrichment steps. Select additional datasets here.'}</p></div><fieldset class="dataset-picker"><legend>Internal datasets</legend>${enrichmentDatasets.map(d => `<label><input type="checkbox" data-enrichment-dataset="${d.id}" ${graphSelection(state.workflow, step).effective.includes(d.id) ? 'checked' : ''} ${graphSelection(state.workflow, step).inherited.includes(d.id) ? 'disabled' : ''}/><span><strong>${d.label}</strong><small>${d.description}</small>${graphSelection(state.workflow, step).inherited.includes(d.id) ? '<small class="inherited-label">Inherited from shared enrichment</small>' : ''}</span></label>`).join('')}</fieldset><label class="form-label">Flag data older than<select data-enrichment-field="maxAgeDays">${[30,90,180,365].map(n => `<option value="${n}" ${config.maxAgeDays === n ? 'selected' : ''}>${n} days</option>`).join('')}</select></label><label class="form-label">If data is stale or missing<select data-enrichment-field="issues"><option value="flag" ${config.issues === 'flag' ? 'selected' : ''}>Flag and continue</option><option value="pause" ${config.issues === 'pause' ? 'selected' : ''}>Pause for data review</option></select></label><p class="field-source">Missing values stay empty. Historical assumptions remain context until an analyst approves their use. Freshness is measured from each dataset’s as-of date.</p>${Object.values(graphEnrichmentErrors(step)).map(e => `<p class="field-error">${esc(e)}</p>`).join('')}${button('Preview selected data', 'preview-enrichment', 'secondary', 'book')}<p class="field-source">Sample adapters only. No internal systems are queried.</p>`;
 }
 function enrichmentPreview(step) {
-  const errors = Object.values(enrichmentErrors(step));
+  const errors = Object.values(graphEnrichmentErrors(step));
   if (errors.length) return `<div class="validation-box">${errors.map(e => `<p>${esc(e)}</p>`).join('')}</div>`;
-  const snapshot = enrichmentSnapshot(step, modal.missing ? [modal.missing] : []);
-  return `<div class="info-banner">Shared by analysis and publishing · Sample snapshot ${enrichmentSampleDate}. Each field retains its source; enrichment does not overwrite source evidence or approve scenario assumptions.</div><label class="form-label">Try a data gap<select id="enrichment-gap"><option value="">Use sample dataset availability</option>${snapshot.datasets.map(d => `<option value="${d.id}" ${modal.missing === d.id ? 'selected' : ''}>${d.label} unavailable</option>`).join('')}</select></label><div class="context-outcome"><strong>${snapshot.paused ? 'Pause before both paths' : snapshot.issues.length ? 'Continue with quality flags' : 'Ready for both paths'}</strong><p>${snapshot.issues.length} dataset(s) stale or missing. Threshold: ${step.enrichment.maxAgeDays} days. ${snapshot.paused ? 'Data review would be required before extraction or publishing.' : 'Source dates and any quality flags travel with the context.'}</p></div><div class="context-grid">${snapshot.datasets.map(d => `<article class="context-card"><div>${badge(d.status, d.status === 'Available' ? 'support-badge' : 'high')}<h3>${d.label}</h3></div><p>${d.values || 'No value returned. Analyst input or a refreshed dataset is needed.'}</p><small>${d.source}<br>As of: ${d.asOf || 'Unavailable'}${d.ageDays === null ? '' : ' · ' + d.ageDays + ' days old'}</small></article>`).join('')}</div><p class="modal-disclaimer">This previews configuration only. Runtime context and data-review tasks would be available from the signal inbox in the full implementation.</p>`;
+  const snapshot = graphSnapshot(state.workflow, step, modal.missing ? [modal.missing] : []);
+  return `<div class="info-banner">${'Context along this connected path'} · Sample snapshot ${enrichmentSampleDate}. Each field retains its source; enrichment does not overwrite source evidence or approve scenario assumptions.</div><label class="form-label">Try a data gap<select id="enrichment-gap"><option value="">Use sample dataset availability</option>${snapshot.datasets.map(d => `<option value="${d.id}" ${modal.missing === d.id ? 'selected' : ''}>${d.label} unavailable</option>`).join('')}</select></label><div class="context-outcome"><strong>${snapshot.paused ? 'Pause this context’s downstream steps' : snapshot.issues.length ? 'Continue with quality flags' : 'Context ready'}</strong><p>${snapshot.issues.length} dataset(s) stale or missing. Threshold: ${step.enrichment.maxAgeDays} days. ${snapshot.paused ? 'Data review would be required before extraction or publishing.' : 'Source dates and any quality flags travel with the context.'}</p></div><div class="context-grid">${snapshot.datasets.map(d => `<article class="context-card"><div>${badge(d.status, d.status === 'Available' ? 'support-badge' : 'high')}<h3>${d.label}</h3>${d.inherited ? '<small class="inherited-label">Inherited from shared enrichment</small>' : ''}</div><p>${d.values || 'No value returned. Analyst input or a refreshed dataset is needed.'}</p><small>${d.source}<br>As of: ${d.asOf || 'Unavailable'}${d.ageDays === null ? '' : ' · ' + d.ageDays + ' days old'}</small></article>`).join('')}</div><p class="modal-disclaimer">This previews configuration only. Runtime context and data-review tasks would be available from the signal inbox in the full implementation.</p>`;
 }
 app.addEventListener('change', event => {
   const dataset = event.target.dataset.enrichmentDataset, field = event.target.dataset.enrichmentField;
   if (!dataset && !field) return;
   const step = state.workflow.steps.find(s => s.id === selectedStep);
   if (step?.type !== 'enrich') return;
+  if (dataset && graphSelection(state.workflow, step).inherited.includes(dataset)) return;
   if (dataset) step.enrichment.datasets = enrichmentDatasets.filter(d => d.id === dataset ? event.target.checked : step.enrichment.datasets.includes(d.id)).map(d => d.id);
   if (field) step.enrichment[field] = field === 'maxAgeDays' ? Number(event.target.value) : event.target.value;
   state.workflow.active = false; save(); renderView();
@@ -646,3 +696,21 @@ app.addEventListener('change', event => {
 document.querySelector('#modal-root').addEventListener('change', event => {
   if (event.target.id === 'enrichment-gap') { modal.missing = event.target.value; renderModal(); }
 });
+
+function graphEnrichmentErrors(step){try{graphSnapshot(state.workflow,step);return [];}catch(error){return [error.message];}}
+function addGraphCard(type){
+  const w=state.workflow,step=newStep(type,undefined,state.user.email);
+  delete step.branch;delete step.detached;step.x=60+(w.steps.length%3)*320;step.y=60+Math.floor(w.steps.length/3)*250;
+  while(w.steps.some(s=>Math.abs(s.x-step.x)<270&&Math.abs(s.y-step.y)<210))step.y+=250;
+  w.steps.push(step);w.active=false;selectedStep=step.id;selectedEdge=null;save();renderView();
+  document.querySelector('.flow-node.selected')?.scrollIntoView({block:'nearest',inline:'nearest'});
+}
+function arrangeGraph(){
+  const w=state.workflow,levels=new Map();
+  function level(id,seen=new Set()){if(levels.has(id))return levels.get(id);if(seen.has(id))return 0;seen.add(id);const parents=w.edges.filter(e=>e.to===id);const value=parents.length?1+Math.max(...parents.map(e=>level(e.from,new Set(seen)))):0;levels.set(id,value);return value;}
+  const rowHeights={};for(const step of w.steps){const row=level(step.id),node=document.querySelector('[data-step="'+step.id+'"]'),outputs=document.querySelector('[data-output-for="'+step.id+'"]');rowHeights[row]=Math.max(rowHeights[row]||260,(node?.offsetHeight||145)+(outputs?.offsetHeight||0)+80);}
+  const rowY=[50];for(let row=0;row<Math.max(0,...levels.values());row++)rowY[row+1]=rowY[row]+(rowHeights[row]||260);
+  const columns={};for(const step of w.steps){const row=level(step.id);step.x=70+(columns[row]||0)*350;step.y=rowY[row];columns[row]=(columns[row]||0)+1;}
+}
+app.addEventListener('keydown',event=>{if(event.target.matches('[data-edge]')&&['Enter',' '].includes(event.key)){event.preventDefault();selectedEdge=event.target.dataset.edge;selectedStep=null;renderView();}});
+document.addEventListener('keydown',event=>{if((event.ctrlKey||event.metaKey)&&event.key.toLowerCase()==='z'&&!['INPUT','TEXTAREA','SELECT'].includes(event.target.tagName)&&view==='workflow'&&!workflowLibrary){event.preventDefault();undoGraph();}});

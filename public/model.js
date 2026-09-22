@@ -2,7 +2,9 @@ export const sampleUser = { name: 'Alex Laurent', email: 'alex.laurent@example.c
 export const defaultSummaryPrompt = 'Summarize this Super Signal for a credit analyst. Identify the affected issuer, key developments, potential credit implications, and uncertainties. Distinguish evidence from assumptions, include supporting and conflicting signals, and cite the source references. Keep the summary concise and do not infer a rating action.';
 
 export const catalog = {
-  super: { label: 'Create / update Super Signal', category: 'Aggregate', color: 'purple', icon: 'network', description: 'Create on the first arrival; stop unchanged duplicates here, and forward updated versions when content changes.', field: 'Credit topic', options: ['Refinancing pressure', 'Margin compression', 'Demand & revenue weakness', 'Governance risk'] },
+  ai: { label: 'AI Analysis', category: 'Analyze', color: 'purple', icon: 'sparkles', description: 'Apply your prompt to the Super Signal and available enriched context, then pass the analysis to a publishing step.', field: 'Analysis input', options: ['Super Signal + enriched context'] },
+  route: { label: 'Route by signal type', category: 'Route', color: 'purple', icon: 'network', description: 'Send each Super Signal to the path for its signal type. Shared publishing can run independently.', field: 'Routing', options: ['Match signal type'] },
+  super: { label: 'Create / update Super Signal', category: 'Aggregate', color: 'purple', icon: 'network', description: 'Create on the first arrival; stop unchanged duplicates here, and forward updated versions when content changes.', field: 'Signals to monitor', options: ['Refinancing pressure', 'Margin compression', 'Demand & revenue weakness', 'Governance risk', 'Liquidity pressure'] },
   watch: { label: 'Source', category: 'Collect', color: 'blue', icon: 'radio', description: 'Bring your trusted information together.', field: 'Sources to watch', options: ['All connected sources', 'Policy & regulatory sources', 'News & subscriptions'] },
   match: { label: 'Match my portfolio', category: 'Filter', color: 'purple', icon: 'briefcase', description: 'Continue only when the Super Signal relates to your selected portfolio. Stop unmatched signals here.', field: 'Coverage universe', options: ['European corporates', 'All covered issuers', 'Industrials & automotive'] },
   enrich: { label: 'Enrich credit context', category: 'Context', color: 'teal', icon: 'layers', description: 'Bring approved internal data into one dated context snapshot shared by both paths.', field: 'Context snapshot', options: ['Latest available approved data'] },
@@ -14,7 +16,36 @@ export const catalog = {
   job: { label: 'Create an event-driven review', category: 'Act', color: 'teal', icon: 'clipboard', description: 'Start a tracked review for the affected credit.', field: 'Review type', options: ['Event-driven credit review', 'Liquidity review', 'Sector impact review'] },
 };
 
+export function selectedSignalTypes(step) {
+  return step?.signalTypes ?? (step?.value ? [step.value] : []);
+}
+export function configureSignalRoutes(workflow) {
+  const steps = workflow.steps, superStep = steps.find(s => s.type === 'super');
+  let router = steps.find(s => s.type === 'route');
+  if (!router) {
+    router = { id:crypto.randomUUID(), type:'route', value:'Match signal type', note:'', routes:[] };
+    const shared = steps.find(s => s.type === 'enrich' && !branchOf(s)) || steps.find(s => s.type === 'match');
+    steps.splice(steps.indexOf(shared) + 1, 0, router);
+  }
+  for (const type of selectedSignalTypes(superStep)) {
+    if (router.routes.some(r => r.signalType === type)) continue;
+    const route = {id:'route-' + crypto.randomUUID(), signalType:type}; router.routes.push(route);
+    const existing = steps.filter(s => branchOf(s) === 'analysis');
+    const context = newStep('enrich'); context.branch = route.id;
+    context.enrichment.datasets = type === 'Margin compression' ? ['financials', 'models'] : type === 'Refinancing pressure' ? ['ratings', 'debt', 'models'] : ['ratings', 'financials'];
+    const defaults = ['extract', 'review', ...(['Refinancing pressure', 'Margin compression', 'Liquidity pressure'].includes(type) ? ['scenario'] : ['assign'])].map(t => newStep(t));
+    if (type === 'Margin compression') { defaults[0].value = 'Revenue, margins & cost changes'; defaults[2].value = 'Margin stress'; }
+    if (type === 'Liquidity pressure') { defaults[0].value = 'Liquidity & covenant headroom'; defaults[2].value = 'Liquidity sensitivity'; }
+    const path = existing.length ? existing : defaults;
+    path.forEach(s => { s.branch = route.id; });
+    if (existing.length) steps.splice(steps.indexOf(existing[0]), 0, context);
+    else steps.push(context, ...path);
+  }
+  steps.forEach(s => { delete s.x; delete s.y; }); workflow.active = false;
+  return router;
+}
 export function newStep(type, id = crypto.randomUUID(), userEmail = sampleUser.email) {
+  if (type === 'ai') return {id, type, value:'Super Signal + enriched context', note:'', branch:'analysis', prompt:'Analyze the potential credit impact using the Super Signal and enriched context. Cite the evidence and dataset dates, distinguish facts from assumptions, and identify risks, offsets, and missing information.'};
   if (type === 'enrich') return { id, type, value: 'Latest available approved data', note: '', enrichment: { datasets: ['ratings', 'financials', 'debt'], maxAgeDays: 90, issues: 'flag' } };
   if (type === 'publish') return { id, type, value: 'Analytical Desktop', note: '', branch: 'summary', publishing: { prompt: defaultSummaryPrompt, to: userEmail, additionalRecipients: [] } };
   if (type === 'watch') return newSource('web', id);
@@ -60,6 +91,7 @@ export const stories = [
 ];
 
 export function validateWorkflow(steps) {
+  if (steps.some(s => s.detached)) return ['Connect or remove all unconnected cards before running the workflow.', ...validateWorkflow(steps.filter(s => !s.detached))];
   const errors = [], sources = steps.filter(s => s.type === 'watch'), joins = steps.filter(s => s.type === 'super');
   if (!sources.length) errors.push('Add at least one source to start your workflow.');
   if (joins.length !== 1) errors.push('Use one Super Signal step before portfolio filtering.');
@@ -67,7 +99,7 @@ export function validateWorkflow(steps) {
   const joinIndex = steps.findIndex(s => s.type === 'super');
   if (steps.some((s, i) => s.type === 'watch' ? i > joinIndex : s.type !== 'super' && i < joinIndex)) errors.push('Connect all sources to the Super Signal before shared processing.');
   if (steps.filter(s => s.type === 'match').length !== 1 || steps[joinIndex + 1]?.type !== 'match') errors.push('Match your portfolio immediately after creating the Super Signal.');
-  const contextSteps = steps.filter(step => step.type === 'enrich');
+  const contextSteps = steps.filter(step => step.type === 'enrich' && !branchOf(step));
   if (contextSteps.length > 1 || (contextSteps.length && steps[steps.findIndex(step => step.type === 'match') + 1]?.type !== 'enrich')) errors.push('Place one shared enrichment step immediately after the portfolio filter.');
   if (new Set(steps.map(s => s.id)).size !== steps.length) errors.push('Each workflow node must have a unique identifier.');
   if (!steps.some(s => ['scenario', 'assign', 'job', 'publish'].includes(s.type))) errors.push('Add an action to complete your workflow.');
@@ -75,14 +107,21 @@ export function validateWorkflow(steps) {
     if (!catalog[step.type]) { errors.push('This workflow contains an unsupported step.'); continue; }
     if (step.type === 'watch') {
       for (const message of Object.values(sourceErrors(step))) errors.push(`${step.name || 'Unnamed source'}: ${message}`);
+    } else if (step.type === 'super') {
+      const selections = selectedSignalTypes(step);
+      if (!selections.length || selections.some(value => !catalog.super.options.includes(value))) errors.push('Select at least one supported signal to monitor.');
     } else if (!catalog[step.type].options.includes(step.value)) errors.push(`Choose a valid setting for ${catalog[step.type].label}.`);
-    if (step.type === 'enrich') errors.push(...enrichmentErrors(step));
-    if (step.type === 'publish') for (const message of Object.values(publishingErrors(step))) errors.push(`Summarize and Publish: ${message}`);
+    if (step.type === 'enrich') errors.push(...enrichmentErrors(step, steps));
+    if (step.type === 'ai' && !step.prompt?.trim()) errors.push('AI Analysis: enter an analysis prompt.');
+    if (step.type === 'publish') {
+      for (const message of Object.values(publishingErrors(step))) errors.push(`Summarize and Publish: ${message}`);
+      if (step.publishing?.content === 'analysis' && !upstreamAnalysis(steps, step).some(s => s.id === step.publishing.analysisStepId)) errors.push('Publish analysis: select an earlier AI Analysis step on this path.');
+    }
 
   }
   for (const branch of workflowBranches(steps)) {
     const firstType = branch.id === 'analysis' ? 'extract' : 'publish';
-    if (branch.steps[0].type !== firstType) errors.push(`${branch.label} must start with ${catalog[firstType].label}.`);
+    if (!branch.signalType && branch.steps[0].type !== firstType && !(branch.id === 'analysis' && ['ai', 'enrich'].includes(branch.steps[0].type))) errors.push(`${branch.label} must start with ${catalog[firstType].label}.`);
     if (!branch.steps.some(step => ['scenario', 'assign', 'job', 'publish'].includes(step.type))) errors.push(`${branch.label}: add an action to complete this path.`);
     const seen = new Set();
     for (const step of branch.steps) {
@@ -91,7 +130,19 @@ export function validateWorkflow(steps) {
       seen.add(step.type);
     }
   }
-  if (steps.some(step => branchOf(step) && !['analysis', 'summary'].includes(branchOf(step)))) errors.push('Choose a valid branch for each downstream step.');
+  const router = steps.find(s => s.type === 'route');
+  const routes = router?.routes || [];
+  if (router) {
+    const sharedEnd = contextSteps[0] || steps.find(s => s.type === 'match');
+    if (steps[steps.indexOf(sharedEnd) + 1] !== router || steps.filter(s => s.type === 'route').length !== 1) errors.push('Place one router after portfolio matching and optional shared enrichment.');
+    for (const type of selectedSignalTypes(joins[0])) if (routes.filter(r => r.signalType === type).length !== 1) errors.push(`Configure exactly one route for ${type}.`);
+    for (const route of routes) {
+      if (!selectedSignalTypes(joins[0]).includes(route.signalType)) errors.push(`Select ${route.signalType} in Signals to monitor, or remove its route.`);
+      if (!steps.some(s => branchOf(s) === route.id)) errors.push(`${route.signalType}: add steps to this route.`);
+    }
+    if (steps.some(s => branchOf(s) === 'analysis')) errors.push('Assign analysis steps to a signal route.');
+  } else if (selectedSignalTypes(joins[0]).length > 1) errors.push('Add Route by signal type for workflows monitoring multiple signals.');
+  if (steps.some(step => branchOf(step) && !['analysis', 'summary', ...routes.map(r => r.id)].includes(branchOf(step)))) errors.push('Choose a valid branch for each downstream step.');
   return [...new Set(errors)];
 }
 
@@ -157,22 +208,98 @@ export function sourceSummary(step) {
   return config.url || config.inbox || config.account || config.team || config.group || 'Configure this source';
 }
 export function branchOf(step) {
-  return ['watch', 'super', 'match', 'enrich'].includes(step.type) ? null : step.branch || (step.type === 'publish' ? 'summary' : 'analysis');
+  if (step.detached) return null;
+  return step.branch || (['watch', 'super', 'match', 'enrich', 'route'].includes(step.type) ? null : step.type === 'publish' ? 'summary' : 'analysis');
 }
 export function workflowBranches(steps) {
-  return [{ id: 'analysis', label: 'Scenario analysis' }, { id: 'summary', label: 'Summary & publishing' }].map(branch => ({ ...branch, steps: steps.filter(step => branchOf(step) === branch.id) })).filter(branch => branch.steps.length);
+  steps = steps.filter(s => !s.detached);
+  const routes = steps.find(s => s.type === 'route')?.routes || [];
+  return [...routes.map(r => ({...r, label:r.signalType})), { id: 'analysis', label: 'Scenario analysis' }, { id: 'summary', label: 'Shared publishing' }].map(branch => ({ ...branch, steps: steps.filter(step => branchOf(step) === branch.id) })).filter(branch => branch.steps.length);
 }
 export function workflowEdges(steps) {
+  const draftEdges = steps.filter(s => s.detached && s.draftNext && steps.some(t => t.detached && t.id === s.draftNext)).map(s => ({from:s.id,to:s.draftNext,draft:true}));
+  steps = steps.filter(s => !s.detached);
   const sources = steps.filter(s => s.type === 'watch'), superStep = steps.find(s => s.type === 'super'), match = steps.find(s => s.type === 'match');
   const edges = superStep ? sources.map(s => ({ from: s.id, to: superStep.id })) : [];
   if (superStep && match) edges.push({ from: superStep.id, to: match.id });
-  const context = steps.find(step => step.type === 'enrich');
+  const context = steps.find(step => step.type === 'enrich' && !branchOf(step)), router = steps.find(s => s.type === 'route');
   if (match && context) edges.push({ from: match.id, to: context.id });
+  if (router && match) edges.push({ from: (context || match).id, to: router.id });
   if (match) for (const branch of workflowBranches(steps)) {
-    const path = [context || match, ...branch.steps];
+    const path = [branch.signalType ? router : context || match, ...branch.steps];
     for (let i = 0; i < path.length - 1; i++) edges.push({ from: path[i].id, to: path[i + 1].id, branch: branch.id });
   }
-  return edges;
+  return [...edges, ...draftEdges];
+}
+export function stepInsertionTargets(steps, afterId) {
+  steps = steps.filter(s => !s.detached);
+  const anchor = steps.find(s => s.id === afterId);
+  if (!anchor) return [];
+  const branch = branchOf(anchor), router = steps.find(s => s.type === 'route');
+  if (branch) return [{id:branch, label:workflowBranches(steps).find(b => b.id === branch)?.label || branch, types:['enrich','ai','extract','review','scenario','publish','assign','job']}];
+  if (['watch','super'].includes(anchor.type)) return [];
+  const targets = [];
+  if (anchor.type === 'match' && !steps.some(s => s.type === 'enrich' && !branchOf(s))) targets.push({id:'shared',label:'Shared context · before paths split',types:['enrich']});
+  if (['match','enrich'].includes(anchor.type) && !router) targets.push({id:'routing',label:'Route by signal type',types:['route']});
+  if (anchor.type === 'route') targets.push(...(router.routes || []).map(r => ({id:r.id,label:r.signalType + ' · start of path',types:['enrich','ai','extract','review','scenario','publish','assign','job']})));
+  if (!router && ['match','enrich'].includes(anchor.type)) targets.push({id:'analysis',label:'Analysis · start of path',types:['enrich','ai','extract']});
+  if (anchor.type !== 'route') targets.push({id:'summary',label:'Shared publishing · start of path',types:['publish']});
+  return targets;
+}
+export function insertWorkflowStep(workflow, afterId, targetId, type, userEmail = sampleUser.email) {
+  const steps = workflow.steps, anchor = steps.find(s => s.id === afterId);
+  const target = stepInsertionTargets(steps, afterId).find(t => t.id === targetId);
+  if (!target?.types.includes(type)) throw new Error('Choose a supported step for this insertion point.');
+  if (type === 'route') return configureSignalRoutes(workflow);
+  const step = newStep(type, undefined, userEmail);
+  if (targetId === 'shared') delete step.branch; else step.branch = targetId;
+  const first = steps.find(s => branchOf(s) === targetId);
+  const index = branchOf(anchor) || targetId === 'shared' ? steps.indexOf(anchor) + 1 : first ? steps.indexOf(first) : steps.length;
+  steps.splice(index, 0, step);
+  if (type === 'publish') { const analysis = upstreamAnalysis(steps, step).at(-1); if (analysis) { step.publishing.content = 'analysis'; step.publishing.analysisStepId = analysis.id; } }
+  steps.filter(s => targetId === 'shared' || branchOf(s) === targetId).forEach(s => { delete s.x; delete s.y; }); workflow.active = false;
+  return step;
+}
+export function connectCanvasStep(workflow, fromId, toId, routeId) {
+  const steps = workflow.steps, from = steps.find(s => s.id === fromId), to = steps.find(s => s.id === toId);
+  if (!from || !to || from === to || !to.detached) throw new Error('Connect an output to an unconnected card’s input.');
+  if (steps.some(s => s.draftNext === to.id)) throw new Error('This input already has a connection. Connect the first card in that chain.');
+  if (from.detached) {
+    if (['watch','super','match','route'].includes(from.type) || ['watch','super','match','route'].includes(to.type)) throw new Error('Connect these structural steps to the workflow before adding processing cards.');
+    if (from.draftNext) throw new Error('This output is already connected. Continue from the last card in the chain.');
+    let current = to; const seen = new Set();
+    while (current) { if (current.id === from.id || seen.has(current.id)) throw new Error('A connection cannot create a loop.'); seen.add(current.id); current = steps.find(s => s.id === current.draftNext); }
+    from.draftNext = to.id; workflow.active = false; return to;
+  }
+  const connected = steps.filter(s => !s.detached);
+  if (to.type === 'watch') throw new Error('Connect a source’s output to the Super Signal input.');
+  if (from.type === 'super' && to.type === 'match' && !connected.some(s => s.type === 'match')) {
+    steps.splice(steps.indexOf(to), 1); steps.splice(steps.indexOf(from) + 1, 0, to); delete to.detached; delete to.branch;
+  } else {
+    const targets = stepInsertionTargets(connected, from.id).filter(t => t.types.includes(to.type));
+    const target = routeId ? targets.find(t => t.id === routeId) : targets.length === 1 ? targets[0] : null;
+    if (!target) throw new Error(targets.length > 1 ? 'Choose the output for the path you want to connect.' : 'This connection is not supported here. Choose a downstream processing card or the appropriate route output.');
+    if (to.type === 'route') {
+      steps.splice(steps.indexOf(to), 1); delete to.detached; delete to.branch; to.routes = [];
+      steps.splice(steps.indexOf(from) + 1, 0, to); configureSignalRoutes(workflow);
+    } else {
+      steps.splice(steps.indexOf(to), 1);
+      if (target.id === 'shared') delete to.branch; else to.branch = target.id;
+      const first = steps.find(s => !s.detached && branchOf(s) === target.id);
+      const index = branchOf(from) || target.id === 'shared' ? steps.indexOf(from) + 1 : first ? steps.indexOf(first) : steps.length;
+      delete to.detached; steps.splice(index, 0, to);
+      if (to.type === 'publish') { const ai = upstreamAnalysis(steps, to).at(-1); if (ai) { to.publishing.content = 'analysis'; to.publishing.analysisStepId = ai.id; } }
+    }
+  }
+  const childId = to.draftNext;
+  delete to.draftNext;
+  if (childId) connectCanvasStep(workflow, to.id, childId, branchOf(to));
+  workflow.active = false; return to;
+}
+export function connectCanvasSource(workflow, fromId, toId) {
+  const source = workflow.steps.find(s => s.id === fromId), target = workflow.steps.find(s => s.id === toId);
+  if (source?.type !== 'watch' || !source.detached || target?.type !== 'super' || target.detached) throw new Error('Connect a new source to the existing Super Signal.');
+  workflow.steps.splice(workflow.steps.indexOf(source), 1); workflow.steps.splice(workflow.steps.indexOf(target), 0, source); delete source.detached; workflow.active = false;
 }
 function migrateBranches(workflow) {
   for (const step of workflow.steps) {
@@ -269,7 +396,8 @@ export function approveInboxRun(run) {
 
 export function publishingErrors(step) {
   const errors = {}, config = step.publishing;
-  if (!config?.prompt?.trim()) errors.prompt = 'Enter a summarization prompt.';
+  if (config?.content !== 'analysis' && !config?.prompt?.trim()) errors.prompt = 'Enter a summarization prompt.';
+  if (config?.content && !['summary', 'analysis'].includes(config.content)) errors.content = 'Choose summary or AI analysis.';
   if (!catalog.publish.options.includes(step.value)) errors.platform = 'Choose a publishing platform.';
   if (step.value === 'Email') {
     const emailPattern = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -287,6 +415,17 @@ export function publishingErrors(step) {
 export function publishingRecipients(step) {
   return step.value === 'Email' ? [step.publishing.to, ...step.publishing.additionalRecipients].map(email => email.trim()) : [];
 }
+export function upstreamAnalysis(steps, step) {
+  if (step.detached) return [];
+  return steps.slice(0, steps.indexOf(step)).filter(s => !s.detached && s.type === 'ai' && branchOf(s) === branchOf(step));
+}
+export function analysisContext(steps, step) {
+  if (step.detached) return [];
+  const preceding = steps.slice(0, steps.indexOf(step));
+  const enrichments = preceding.filter(s => !s.detached && s.type === 'enrich' && (!branchOf(s) || branchOf(s) === branchOf(step)));
+  const ids = [...new Set(enrichments.flatMap(s => enrichmentSelection(s, steps).effective))];
+  return enrichmentDatasets.filter(d => ids.includes(d.id));
+}
 
 
 export const enrichmentDatasets = [
@@ -297,20 +436,27 @@ export const enrichmentDatasets = [
   { id: 'models', label: 'Prior assumptions & scenario results', description: 'Approved baseline assumptions and historical scenario outcomes.', source: 'Model & scenario archive', asOf: '2026-03-31', values: 'Historical stress: +100 bps spread assumption. Prior scenario output unavailable in this sample; do not substitute for a current result.' },
 ];
 export const enrichmentSampleDate = '2026-09-20';
-export function enrichmentErrors(step) {
+export function enrichmentSelection(step, steps = []) {
+  const shared = branchOf(step) ? steps.slice(0, steps.indexOf(step)).find(s => !s.detached && s.type === 'enrich' && !branchOf(s)) : null;
+  const inherited = [...new Set(shared?.enrichment?.datasets || [])];
+  const additional = (step.enrichment?.datasets || []).filter(id => !inherited.includes(id));
+  return { inherited, additional, effective: [...new Set([...inherited, ...additional])] };
+}
+export function enrichmentErrors(step, steps = []) {
   const config = step.enrichment, errors = [];
-  if (!config?.datasets?.length) errors.push('Enrich credit context: select at least one dataset.');
+  if (!enrichmentSelection(step, steps).effective.length) errors.push('Enrich credit context: select at least one dataset.');
   if (config?.datasets?.some(id => !enrichmentDatasets.some(dataset => dataset.id === id))) errors.push('Enrich credit context: choose supported datasets.');
   if (![30, 90, 180, 365].includes(Number(config?.maxAgeDays))) errors.push('Enrich credit context: choose a freshness threshold.');
   if (!['flag', 'pause'].includes(config?.issues)) errors.push('Enrich credit context: choose how to handle data gaps.');
   return errors;
 }
-export function enrichmentSnapshot(step, missingDatasetIds = []) {
-  const errors = enrichmentErrors(step); if (errors.length) throw new Error(errors.join(' '));
-  const datasets = enrichmentDatasets.filter(dataset => step.enrichment.datasets.includes(dataset.id)).map(dataset => {
+export function enrichmentSnapshot(step, missingDatasetIds = [], steps = []) {
+  const errors = enrichmentErrors(step, steps); if (errors.length) throw new Error(errors.join(' '));
+  const selection = enrichmentSelection(step, steps);
+  const datasets = enrichmentDatasets.filter(dataset => selection.effective.includes(dataset.id)).map(dataset => {
     const ageDays = Math.round((Date.parse(enrichmentSampleDate) - Date.parse(dataset.asOf)) / 86400000);
     const missing = missingDatasetIds.includes(dataset.id);
-    return { ...dataset, ageDays: missing ? null : ageDays, asOf: missing ? null : dataset.asOf, values: missing ? null : dataset.values, status: missing ? 'Missing' : ageDays > Number(step.enrichment.maxAgeDays) ? 'Stale' : 'Available' };
+    return { ...dataset, inherited: selection.inherited.includes(dataset.id), ageDays: missing ? null : ageDays, asOf: missing ? null : dataset.asOf, values: missing ? null : dataset.values, status: missing ? 'Missing' : ageDays > Number(step.enrichment.maxAgeDays) ? 'Stale' : 'Available' };
   });
   const issues = datasets.filter(dataset => dataset.status !== 'Available');
   return { issuer: 'Aster Automotive', retrievedAt: enrichmentSampleDate, datasets, issues, paused: issues.length > 0 && step.enrichment.issues === 'pause' };

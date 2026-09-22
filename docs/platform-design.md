@@ -1,5 +1,17 @@
 # Credit signal platform
 
+## Current designer contract: explicit graph
+
+The active editor uses `public/graph.js` with workflow schema 5: `{steps, edges}`. Every edge has an ID, source, target, and optional signal condition. Steps' array order and positions have no execution meaning. Earlier inferred-branch helpers in `model.js` are legacy and are not used by the editor or simulator.
+
+Blank workflows have no cards, edges, reserved lanes, or placeholder actions. Templates populate editable graph records. Adding and moving cards never changes edges; connecting adds exactly one edge. Any card can be removed along with only its incident edges. Deleting an edge leaves both cards. Undo restores graph snapshots during the session.
+
+Data context and available AI outputs are computed through actual ancestors. Multiple sources may converge at Super Signal; other steps have one input to avoid ambiguous joins. Ordinary fan-out executes all outgoing edges. Route by signal type uses explicitly named conditional outputs. Cycles, incompatible structural connections, duplicate edges, and ambiguous merges receive immediate connection feedback. Incomplete drafts can be saved; activation and simulation require a connected, configured source-to-action flow.
+
+Rendering and simulation consume the same edge records. All completed edges use the same solid styling, regardless of origin; only the line currently being drawn is dashed. Existing edges remain visible even if their routing condition is no longer monitored, so analysts can remove or repair them. The initial rollout resets old workflow designs once, retaining a local recovery backup and preserving inbox/action history.
+
+The sections below include the earlier conceptual evolution; the explicit graph contract above supersedes positional insertion, protected nodes, and inferred branches.
+
 ## Product intent
 
 Give credit analysts a configurable path from information to a justified credit action. Analysts bring their own sources, attach information to the credits they cover, combine related evidence, extract useful assumptions, and choose what happens next through a visual process builder.
@@ -113,7 +125,27 @@ Acceptance examples:
 
 Confirm identity and tenancy boundaries, required sources and licenses, portfolio/exposure data ownership, scenario model APIs, task-system integrations, evidence retention, permitted AI providers, and action approval policies. These do not prevent a prototype but determine the production integration plan.
 
-### Shared credit-context enrichment
+### Signal-specific routing and enrichment
+
+Multi-signal workflows use a Route by signal type node after portfolio matching (and optional shared enrichment). Each selected type has exactly one route, with its own enrichment datasets, extraction settings, review checkpoint, and actions. A shared publishing path remains independent. Existing analysis settings move to the first selected type when routing is introduced; additional routes receive editable defaults. Existing shared enrichment remains shared.
+
+Refinancing routes suggest ratings, debt/liquidity, and prior assumptions, followed by refinancing extraction and downside analysis. Margin routes suggest financials and prior assumptions, followed by margin extraction and stress analysis. Other types use corresponding liquidity settings or an analyst assignment when no matching scenario model is offered. These are illustrative defaults requiring analyst configuration.
+
+The arrival simulator selects a signal type, visits only its matching route, dims other routes as skipped, and pauses at that route's data or assumption review. Duplicate arrivals stop before routing. The new-workflow dialog includes a two-route refinancing/margin starting point. These simulated routes do not execute real models or generate new inbox review tasks.
+
+### Unconnected canvas cards and manual connections
+
+Add Step displays the complete catalog. Choosing a card adds it unconnected, without changing existing execution paths. Analysts drag cards to position them and connect an output to an input by dragging or clicking the ports. Split outputs are labeled with their paths. New processing cards can form a detached chain before the chain is attached to a workflow. Connecting to a path splices the new card or chain ahead of its existing successor. Source aggregation and portfolio-filter ordering remain constrained; invalid connections and loops are rejected. Unconnected cards block activation and simulation, and their data does not enter connected analysis context. Positions, connections, and configuration persist locally.
+
+### AI Analysis and publishing its output
+
+AI Analysis is an optional path step with a saved analyst prompt. Its inputs are the Super Signal and datasets supplied by earlier shared or same-path enrichment; it excludes later enrichment and other routes. It can lead directly to publishing without scenario extraction or assumption review.
+
+Publishing offers either a Super Signal summary or an explicitly linked earlier AI Analysis output from the same path. Adding publishing after an analysis step selects the nearest eligible analysis by default. Analysts retain the existing Analytical Desktop/Email destinations and recipient controls. Missing, moved, or cross-route analysis references block activation and simulation.
+
+The prototype saves prompts and output links, previews an explicitly illustrative narrative with context provenance, and animates analysis and delivery. It does not call an AI provider, execute the prompt, or send publications. Production execution should bind the prompt, signal revision, context snapshot, and generated analysis to the run, with publishing consuming that exact analysis output.
+
+### Optional shared credit-context enrichment
 
 The optional **Enrich credit context** step belongs immediately after portfolio matching and before the analysis/publishing split. Entity identification needed for Super Signal grouping remains an adapter/normalization responsibility. Context enrichment fetches datasets only for covered credits and gives both downstream paths the same dated snapshot.
 

@@ -4,6 +4,14 @@ A browser-based prototype for credit analysts: connect evidence to a credit stor
 
 This site was created with the `gpt-6-astra` model.
 
+## Workflow designer
+
+New workflows default to an empty canvas. Optional templates contain ordinary, editable cards and arrows. Add Step opens the full catalog and adds an unconnected card. Drag cards to position them; drag an output dot to an input dot (or click the two dots) to connect them. A connection never inserts a card into another connection or rewires existing arrows.
+
+Select an arrow to remove it. Every card can be removed; only its attached arrows are removed, leaving the rest of the canvas unchanged. Undo or Ctrl/Cmd+Z restores edits during the current session. Normal multiple outputs run in parallel; routing outputs select the named signal type. Check workflow explains incomplete configurations, while simulation follows the visible edges.
+
+The graph-designer update resets legacy workflow designs once on first load. Inbox reviews, actions, and sources remain. Previous designs are retained in the local saved state's `workflowResetBackup` for recovery; they are not loaded into the new editor.
+
 ## Run
 
 Requires Node.js 18 or newer. No dependency installation is needed.
