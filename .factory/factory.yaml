@@ -1,0 +1,31 @@
+# Cradleworks settings for this repository, first written by `factory init`.
+# Keys not set here come from the factory defaults; `factory config` lists them.
+project: sigpro-prototype
+
+adapters:
+  scm: github
+  ci: none
+  tracker: github-issues
+  sandbox: local-docker   # one container per task, from .factory/image
+  runtime: cli-agent
+
+runtime:
+  agent: claude-code
+  model: claude-sonnet-5-5
+
+stack:
+  # Built from .factory/image/Dockerfile:
+  #   docker build --build-context project=. -t cradleworks/sigpro-prototype-dev:1 .factory/image
+  image: cradleworks/sigpro-prototype-dev:1
+  build: npm install --no-audit --no-fund
+  test: npm test
+
+context:
+  include: [package.json, README.md, public/, tests/, docs/, server.js]
+  rules: [.factory/rules/*.md]
+
+sandbox:
+  network:
+    mode: allowlist
+    allow:
+      - registry.npmjs.org
