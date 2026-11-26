@@ -29,3 +29,6 @@ sandbox:
     mode: allowlist
     allow:
       - registry.npmjs.org
+budgets:
+  per_task_usd: 10
+  max_rework_loops: 2
